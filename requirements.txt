@@ -1,0 +1,6 @@
+# FMG Policy Shadow Analyzer — runtime dependencies
+#
+# The core tool has ZERO mandatory third-party dependencies (stdlib only).
+# The optional dependency below enables Excel (.xlsx) report generation.
+
+openpyxl>=3.1.0        # optional — Excel export (HTML + JSON work without it)

@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Testing / caching
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Report outputs (may contain sensitive policy data)
+fmg-*/
+reports/
+*.xlsx
+*.html
+shadow_report_*
+
+# Environment
+.env
+*.env
+venv/
+.venv/
