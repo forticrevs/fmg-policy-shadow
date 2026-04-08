@@ -28,7 +28,7 @@ The reports summarize:
 
 ## Core concepts
 
-The analyzer uses industry-standard definitions of rule shadowing under first-match policy evaluation, aligned with terminology from Tufin SecureTrack, AlgoSec, Google Cloud Firewall Insights, and PCI DSS guidelines:
+The analyzer uses industry-standard definitions of rule shadowing under first-match policy evaluation, aligned with terminology from Fortinet, Tufin SecureTrack, AlgoSec, Google Cloud Firewall Insights, and PCI DSS guidelines:
 
 - **Fully Shadowed (Conflict)**: a higher-priority rule with a *different* action completely covers the lower-priority rule's match space. The shadowed rule is unreachable. *(Industry: contradictory shadow, conflicting rule)*
 - **Partially Shadowed (Conflict)**: a higher-priority rule with a *different* action covers part of the lower-priority rule's traffic. *(Industry: partial shadow)*
