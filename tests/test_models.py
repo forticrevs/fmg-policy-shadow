@@ -828,3 +828,82 @@ class TestInstallScope:
             [{"name": "GRP-B", "vdom": "root"}], group_map=group_map,
         )
         assert not a.overlaps(b)
+
+    # --- "is group" flag and vdom-absent group detection ---
+
+    def test_is_group_flag_triggers_expansion(self):
+        """Scope member with 'is group' flag should expand via group_map."""
+        group_map = {
+            "store-firewalls": {("store-fw1", "root"), ("store-fw2", "root")},
+        }
+        members = [{"name": "Store-Firewalls", "is group": True}]
+        s = InstallScope.from_scope_members(members, group_map=group_map)
+        assert not s.is_global
+        assert ("store-fw1", "root") in s.targets
+        assert ("store-fw2", "root") in s.targets
+        assert len(s.targets) == 2
+
+    def test_is_group_flag_integer(self):
+        """FMG sometimes returns 'is group': 1 instead of True."""
+        group_map = {
+            "dc-group": {("dc-fw1", "root")},
+        }
+        members = [{"name": "DC-Group", "is group": 1}]
+        s = InstallScope.from_scope_members(members, group_map=group_map)
+        assert ("dc-fw1", "root") in s.targets
+
+    def test_no_vdom_means_group(self):
+        """Per FMG API docs, a name without vdom = device group."""
+        group_map = {
+            "branch-group": {("br-fw1", "root"), ("br-fw2", "root")},
+        }
+        members = [{"name": "Branch-Group"}]
+        s = InstallScope.from_scope_members(members, group_map=group_map)
+        assert ("br-fw1", "root") in s.targets
+        assert ("br-fw2", "root") in s.targets
+
+    def test_unknown_group_no_overlap_with_devices(self):
+        """A group not in group_map should not overlap with named devices."""
+        group_map = {}
+        a = InstallScope.from_scope_members(
+            [{"name": "Unknown-Group", "is group": True}], group_map=group_map,
+        )
+        b = InstallScope.from_scope_members(
+            [{"name": "FW01", "vdom": "root"}], group_map=group_map,
+        )
+        assert not a.overlaps(b)
+
+    def test_unknown_group_overlaps_with_same_group(self):
+        """Two policies targeting the same unknown group should overlap."""
+        group_map = {}
+        a = InstallScope.from_scope_members(
+            [{"name": "Unknown-Group", "is group": True}], group_map=group_map,
+        )
+        b = InstallScope.from_scope_members(
+            [{"name": "Unknown-Group", "is group": 1}], group_map=group_map,
+        )
+        assert a.overlaps(b)
+
+    def test_no_overlap_different_unknown_groups(self):
+        """Two policies targeting different unknown groups should not overlap."""
+        group_map = {}
+        a = InstallScope.from_scope_members(
+            [{"name": "Group-A", "is group": True}], group_map=group_map,
+        )
+        b = InstallScope.from_scope_members(
+            [{"name": "Group-B", "is group": True}], group_map=group_map,
+        )
+        assert not a.overlaps(b)
+
+    def test_is_group_no_vdom_mixed_with_device(self):
+        """Mix of group (no vdom) and device (with vdom) in same scope."""
+        group_map = {
+            "grp-x": {("fw10", "root")},
+        }
+        members = [
+            {"name": "GRP-X"},  # no vdom = group
+            {"name": "FW20", "vdom": "dmz"},  # device
+        ]
+        s = InstallScope.from_scope_members(members, group_map=group_map)
+        assert ("fw10", "root") in s.targets
+        assert ("fw20", "dmz") in s.targets

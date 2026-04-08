@@ -150,7 +150,12 @@ def fetch_policies(
         List of CanonicalPolicy in evaluation order.
     """
     url = f"/pm/config/adom/{adom}/pkg/{package}/firewall/policy"
-    result = client.get(url, loadsub=0)
+    # NOTE: loadsub must be 1 (or omitted) so that _scope sub-tables are
+    # included in the response.  With loadsub=0, per-policy installation
+    # scopes are stripped and every policy appears to have global scope,
+    # causing rules that target different device groups to be compared
+    # against each other incorrectly.
+    result = client.get(url)
 
     if not isinstance(result, list):
         if result is None:

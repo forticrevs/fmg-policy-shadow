@@ -586,15 +586,34 @@ class InstallScope:
         targets = set()
         for m in members:
             name = m.get("name", "")
-            vdom = m.get("vdom", "root")
+            vdom = m.get("vdom", "")
             if not name:
                 continue
             key = name.lower()
-            # If this is a device group, expand to individual member devices
-            if group_map and key in group_map:
+
+            # Determine if this scope entry refers to a device group.
+            # FMG signals this in two ways:
+            #   1. Explicit "is group" flag (true / 1)
+            #   2. Absence of "vdom" key — per FMG API docs, a name
+            #      without a vdom is treated as a device group name.
+            is_group_flag = m.get("is group", m.get("is_group", False))
+            is_group = bool(is_group_flag) or ("vdom" not in m)
+
+            if is_group and group_map and key in group_map:
+                # Expand device group to its individual member devices
                 targets.update(group_map[key])
+            elif not is_group and group_map and key in group_map:
+                # Name happens to match a group but has vdom set —
+                # still expand (defensive: FMG isn't always consistent)
+                targets.update(group_map[key])
+            elif is_group and group_map is not None and key not in group_map:
+                # Known to be a group but not in our group_map — treat
+                # as an opaque group identifier so it only overlaps with
+                # itself (never with real device names).
+                targets.add((f"__group__{key}", "__group__"))
             else:
-                targets.add((key, vdom.lower()))
+                # Individual device
+                targets.add((key, (vdom or "root").lower()))
         return cls(is_global=False, targets=targets)
 
     def overlaps(self, other: "InstallScope") -> bool:
