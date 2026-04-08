@@ -601,11 +601,21 @@ class InstallScope:
 
             if is_group and group_map and key in group_map:
                 # Expand device group to its individual member devices
-                targets.update(group_map[key])
+                expanded = group_map[key]
+                if expanded:
+                    targets.update(expanded)
+                else:
+                    # Group exists but has no members — use opaque ID
+                    # so it still overlaps with the same group name.
+                    targets.add((f"__group__{key}", "__group__"))
             elif not is_group and group_map and key in group_map:
                 # Name happens to match a group but has vdom set —
                 # still expand (defensive: FMG isn't always consistent)
-                targets.update(group_map[key])
+                expanded = group_map[key]
+                if expanded:
+                    targets.update(expanded)
+                else:
+                    targets.add((f"__group__{key}", "__group__"))
             elif is_group and group_map is not None and key not in group_map:
                 # Known to be a group but not in our group_map — treat
                 # as an opaque group identifier so it only overlaps with
