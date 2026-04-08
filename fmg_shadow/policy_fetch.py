@@ -100,17 +100,27 @@ def _is_section_title(policy_data: dict) -> bool:
 
 def _extract_scope(policy_data: dict) -> list[dict]:
     """
-    Extract per-policy install scope (_scope or install-on).
+    Extract per-policy install scope.
+
+    FMG returns per-policy installation targets under "scope member" when
+    the request includes option=["scope member"].  Falls back to "_scope"
+    and "install-on" for compatibility.
 
     Returns list of {'name': ..., 'vdom': ...} dicts, or empty list for
-    global scope.
+    global scope (policy applies to all package targets).
     """
-    # _scope is the primary field
+    # "scope member" is the primary field when option=["scope member"]
+    # is used in the API request.
+    scope_member = policy_data.get("scope member")
+    if scope_member and isinstance(scope_member, list):
+        return scope_member
+
+    # _scope is a legacy/alternative field
     scope = policy_data.get("_scope")
     if scope and isinstance(scope, list):
         return scope
 
-    # install-on is an alternative representation
+    # install-on is another alternative representation
     install_on = policy_data.get("install-on")
     if install_on and isinstance(install_on, list):
         return install_on
@@ -150,12 +160,13 @@ def fetch_policies(
         List of CanonicalPolicy in evaluation order.
     """
     url = f"/pm/config/adom/{adom}/pkg/{package}/firewall/policy"
-    # NOTE: loadsub must be 1 (or omitted) so that _scope sub-tables are
-    # included in the response.  With loadsub=0, per-policy installation
-    # scopes are stripped and every policy appears to have global scope,
-    # causing rules that target different device groups to be compared
-    # against each other incorrectly.
-    result = client.get(url)
+    # Per-policy installation targets ("Install On") are NOT included in
+    # the default response — not even with loadsub=1.  They are returned
+    # under the "scope member" key only when option=["scope member"] is
+    # explicitly requested.  Without this, every policy appears to have
+    # global scope, causing rules that target different device groups to
+    # be compared against each other incorrectly.
+    result = client.get(url, option=["scope member"])
 
     if not isinstance(result, list):
         if result is None:
