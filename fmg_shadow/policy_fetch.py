@@ -5,10 +5,8 @@ Retrieves firewall policies from FMG policy packages and converts them
 into CanonicalPolicy objects for shadow analysis.
 """
 
-from __future__ import annotations
-
 import logging
-from typing import Optional
+from typing import Dict, List, Optional, Set, Tuple
 
 from .models import (
     CanonicalPolicy,
@@ -43,7 +41,7 @@ _STATUS_MAP = {
 # Field extraction helpers
 # ---------------------------------------------------------------------------
 
-def _extract_name_list(value) -> list[str]:
+def _extract_name_list(value) -> List[str]:
     """
     Normalize a field that may be a list of strings, list of dicts with
     'name' key, a single string, or None.
@@ -98,7 +96,7 @@ def _is_section_title(policy_data: dict) -> bool:
     return False
 
 
-def _extract_scope(policy_data: dict) -> list[dict]:
+def _extract_scope(policy_data: dict) -> List[dict]:
     """
     Extract per-policy install scope.
 
@@ -137,8 +135,8 @@ def fetch_policies(
     adom: str,
     package: str,
     include_disabled: bool = False,
-    group_map: Optional[dict[str, set[tuple[str, str]]]] = None,
-) -> list[CanonicalPolicy]:
+    group_map: Optional[Dict[str, Set[Tuple[str, str]]]] = None,
+) -> List[CanonicalPolicy]:
     """
     Fetch firewall policies from a FortiManager policy package.
 
@@ -177,7 +175,7 @@ def fetch_policies(
         )
         return []
 
-    policies: list[CanonicalPolicy] = []
+    policies: List[CanonicalPolicy] = []
 
     for seq_num, raw in enumerate(result):
         if not isinstance(raw, dict):
@@ -301,7 +299,7 @@ def fetch_policies_with_objects(
     client,
     adom: str,
     package: str,
-) -> tuple[list[CanonicalPolicy], Optional[dict]]:
+) -> Tuple[List[CanonicalPolicy], Optional[dict]]:
     """
     Fetch policies AND attempt to bulk-fetch all referenced objects.
 
@@ -370,7 +368,7 @@ def _try_get_referred(client, adom: str, package: str) -> Optional[dict]:
             return result
         # Some FMG versions return referred data nested under each policy entry.
         if isinstance(result, list) and result:
-            collected: dict[str, dict] = {}
+            collected: Dict[str, dict] = {}
             for entry in result:
                 if not isinstance(entry, dict):
                     continue
@@ -417,7 +415,7 @@ def _try_expand_datasrc(client, adom: str, package: str) -> Optional[dict]:
         if isinstance(result, list) and result:
             # With expand datasrc, referenced object details are returned under
             # the "expand datasrc" key for each policy entry.
-            objects: dict[str, dict] = {}
+            objects: Dict[str, dict] = {}
             for entry in result:
                 if not isinstance(entry, dict):
                     continue
@@ -447,16 +445,16 @@ def _try_expand_datasrc(client, adom: str, package: str) -> Optional[dict]:
 
 
 def _fetch_objects_by_name(
-    client, adom: str, policies: list[CanonicalPolicy]
+    client, adom: str, policies: List[CanonicalPolicy]
 ) -> Optional[dict]:
     """
     Collect all unique object names from policies and fetch them
     individually by object type.
     """
     # Collect unique names per field
-    addr_names: set[str] = set()
-    svc_names: set[str] = set()
-    schedule_names: set[str] = set()
+    addr_names: Set[str] = set()
+    svc_names: Set[str] = set()
+    schedule_names: Set[str] = set()
 
     for p in policies:
         raw = p.raw_data

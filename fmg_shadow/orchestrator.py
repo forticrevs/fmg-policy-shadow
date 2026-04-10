@@ -6,14 +6,13 @@ Coordinates FMG client connections, package discovery, policy fetching,
 object resolution, and shadow analysis across multiple FMG instances.
 """
 
-from __future__ import annotations
-
 import gc
 import logging
 import time
 from datetime import datetime, timezone
 
 from fmg_shadow.models import PackageResult, RunResult
+from typing import List, Optional
 
 logger = logging.getLogger("fmg_shadow.orchestrator")
 
@@ -23,7 +22,7 @@ def analyze_single_package(
     adom: str,
     package_name: str,
     config: dict,
-    group_map: dict | None = None,
+    group_map: Optional[dict]= None,
     shared_resolver=None,
 ) -> PackageResult:
     """
@@ -146,7 +145,7 @@ def _slim_raw_data(policies) -> None:
         p.raw_data = slim
 
 
-def _discover_packages(client, adom: str, config: dict) -> list[str]:
+def _discover_packages(client, adom: str, config: dict) -> List[str]:
     """
     Discover and filter packages based on config.
 
@@ -263,7 +262,7 @@ def run_analysis(config: dict) -> RunResult:
                 # Concurrent execution is removed — the bottleneck is
                 # API latency (already amortized by the shared resolver)
                 # and memory, not CPU.
-                package_results: list[PackageResult] = []
+                package_results: List[PackageResult] = []
 
                 for i, pkg_name in enumerate(package_names, 1):
                     logger.info(

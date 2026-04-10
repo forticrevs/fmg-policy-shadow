@@ -5,12 +5,10 @@ Handles enumeration of ADOMs, policy packages (with pagination and
 folder nesting), scope member retrieval, and package filtering.
 """
 
-from __future__ import annotations
-
 import fnmatch
 import logging
 import re
-from typing import Optional
+from typing import Dict, List, Optional, Set, Tuple
 
 log = logging.getLogger(__name__)
 
@@ -22,7 +20,7 @@ _PAGE_SIZE = 100
 # ADOM enumeration
 # ---------------------------------------------------------------------------
 
-def get_adoms(client) -> list[dict]:
+def get_adoms(client) -> List[dict]:
     """
     List available ADOMs on the FortiManager.
 
@@ -40,7 +38,7 @@ def get_adoms(client) -> list[dict]:
 # Package enumeration (recursive, paginated)
 # ---------------------------------------------------------------------------
 
-def _flatten_packages(items: list[dict], prefix: str = "") -> list[str]:
+def _flatten_packages(items: List[dict], prefix: str = "") -> List[str]:
     """
     Recursively extract package paths from a list of package/folder dicts.
 
@@ -48,7 +46,7 @@ def _flatten_packages(items: list[dict], prefix: str = "") -> list[str]:
     Packages have type == 'pkg' (or lack 'subobj').
     Returns a flat list of slash-separated package paths.
     """
-    paths: list[str] = []
+    paths: List[str] = []
     for item in items:
         name = item.get("name", "")
         if not name:
@@ -70,7 +68,7 @@ def _flatten_packages(items: list[dict], prefix: str = "") -> list[str]:
     return paths
 
 
-def get_packages(client, adom: str) -> list[str]:
+def get_packages(client, adom: str) -> List[str]:
     """
     List all policy packages in an ADOM, handling pagination and folder
     nesting.  Returns a flat list of package paths (e.g. 'folder/pkg').
@@ -78,7 +76,7 @@ def get_packages(client, adom: str) -> list[str]:
     Uses /pm/pkg/adom/{adom} with range=[offset, page_size] pagination.
     """
     url = f"/pm/pkg/adom/{adom}"
-    all_items: list[dict] = []
+    all_items: List[dict] = []
     offset = 0
 
     while True:
@@ -108,7 +106,7 @@ def get_packages(client, adom: str) -> list[str]:
 # Package scope members
 # ---------------------------------------------------------------------------
 
-def get_device_groups(client, adom: str) -> dict[str, set[tuple[str, str]]]:
+def get_device_groups(client, adom: str) -> Dict[str, Set[Tuple[str, str]]]:
     """
     Fetch device groups for an ADOM and return a mapping of
     group_name (lowered) → set of (device_name, vdom) tuples (lowered).
@@ -126,7 +124,7 @@ def get_device_groups(client, adom: str) -> dict[str, set[tuple[str, str]]]:
     if not isinstance(result, list):
         return {}
 
-    group_map: dict[str, set[tuple[str, str]]] = {}
+    group_map: Dict[str, Set[Tuple[str, str]]] = {}
     for grp in result:
         if not isinstance(grp, dict):
             continue
@@ -136,7 +134,7 @@ def get_device_groups(client, adom: str) -> dict[str, set[tuple[str, str]]]:
         members = grp.get("object member", [])
         if not isinstance(members, list):
             continue
-        devices: set[tuple[str, str]] = set()
+        devices: Set[Tuple[str, str]] = set()
         for m in members:
             if not isinstance(m, dict):
                 continue
@@ -151,7 +149,7 @@ def get_device_groups(client, adom: str) -> dict[str, set[tuple[str, str]]]:
     return group_map
 
 
-def get_package_scope(client, adom: str, package: str) -> list[dict]:
+def get_package_scope(client, adom: str, package: str) -> List[dict]:
     """
     Get the scope members (install targets) for a policy package.
 
@@ -180,10 +178,10 @@ def get_package_scope(client, adom: str, package: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def filter_packages(
-    packages: list[str],
+    packages: List[str],
     pattern: Optional[str] = None,
     regex: Optional[str] = None,
-) -> list[str]:
+) -> List[str]:
     """
     Filter a list of package paths by glob pattern or regex.
 
@@ -198,7 +196,7 @@ def filter_packages(
     if not pattern and not regex:
         return list(packages)
 
-    result: list[str] = []
+    result: List[str] = []
     compiled_re = re.compile(regex) if regex else None
 
     for pkg in packages:

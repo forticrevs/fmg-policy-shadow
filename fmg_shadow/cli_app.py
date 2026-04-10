@@ -5,8 +5,6 @@ CLI entry point for FMG Policy Shadow Analyzer.
 Parses command-line arguments and delegates to the orchestrator.
 """
 
-from __future__ import annotations
-
 import argparse
 import logging
 import os
@@ -14,6 +12,7 @@ import sys
 from pathlib import Path
 
 from fmg_shadow.models import __version__
+from typing import List, Optional
 
 
 logger = logging.getLogger("fmg_shadow")
@@ -175,9 +174,9 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _resolve_fmg_hosts(args: argparse.Namespace) -> list[str]:
+def _resolve_fmg_hosts(args: argparse.Namespace) -> List[str]:
     """Collect FMG hosts from --fmg and --fmg-file arguments."""
-    hosts: list[str] = []
+    hosts: List[str] = []
 
     if args.fmg:
         for entry in args.fmg:
@@ -217,7 +216,7 @@ def _configure_logging(verbose: bool, debug: bool) -> None:
     logging.getLogger("urllib3").setLevel(logging.ERROR)
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(argv: Optional[List[str]]= None) -> None:
     """Parse CLI arguments and run the shadow analysis."""
     parser = build_parser()
     args = parser.parse_args(argv)

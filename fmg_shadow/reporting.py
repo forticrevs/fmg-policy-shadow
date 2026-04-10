@@ -4,13 +4,11 @@ Report generation for FMG Policy Shadow Analysis.
 Produces HTML, Excel (openpyxl), and JSON outputs from RunResult data.
 """
 
-from __future__ import annotations
-
 import json
 import os
 from collections import OrderedDict
 from datetime import datetime
-from typing import Any
+from typing import Any, Dict, List, Optional, Set
 
 from .models import (
     CanonicalPolicy,
@@ -74,7 +72,7 @@ def generate_json_report(run_result: RunResult, output_path: str) -> str:
 
     Returns the output file path.
     """
-    data: dict[str, Any] = {
+    data: Dict[str, Any] = {
         "tool_version": run_result.tool_version,
         "run_timestamp": run_result.run_timestamp,
         "elapsed_seconds": run_result.elapsed_seconds,
@@ -84,7 +82,7 @@ def generate_json_report(run_result: RunResult, output_path: str) -> str:
     }
 
     for pr in run_result.package_results:
-        pkg: dict[str, Any] = {
+        pkg: Dict[str, Any] = {
             "fmg": pr.fmg,
             "adom": pr.adom,
             "package": pr.package,
@@ -113,7 +111,7 @@ def generate_json_report(run_result: RunResult, output_path: str) -> str:
     return output_path
 
 
-def _serialize_policies(policies: list[CanonicalPolicy]) -> list[dict]:
+def _serialize_policies(policies: List[CanonicalPolicy]) -> List[dict]:
     """Serialize a list of CanonicalPolicy to dicts for JSON."""
     result = []
     for p in policies:
@@ -161,7 +159,7 @@ def generate_html_report(run_result: RunResult, output_path: str) -> str:
     adoms = sorted(set(pr.adom for pr in run_result.package_results))
     packages = sorted(set(pr.package for pr in run_result.package_results))
 
-    html_parts: list[str] = []
+    html_parts: List[str] = []
     html_parts.append(_html_head(timestamp))
     html_parts.append(_html_header(timestamp, run_result.tool_version))
     html_parts.append(_html_scope(fmgs, adoms, packages))
@@ -445,8 +443,8 @@ def _html_header(timestamp: str, version: str) -> str:
 """
 
 
-def _html_scope(fmgs: list[str], adoms: list[str], packages: list[str]) -> str:
-    def _pills(items: list[str]) -> str:
+def _html_scope(fmgs: List[str], adoms: List[str], packages: List[str]) -> str:
+    def _pills(items: List[str]) -> str:
         return "".join(f'<span class="scope-pill">{_esc(i)}</span>' for i in items)
     return f"""<div class="card">
   <h3>Analysis Scope</h3>
@@ -482,13 +480,13 @@ def _html_dashboard(counts: dict) -> str:
 """
 
 
-def _html_package_cards(package_results: list[PackageResult]) -> str:
+def _html_package_cards(package_results: List[PackageResult]) -> str:
     if not package_results:
         return "<p>No packages analyzed.</p>"
     html = "<h2>Package Results</h2>\n"
 
     # Group by FMG instance
-    fmg_groups: OrderedDict[str, list[PackageResult]] = OrderedDict()
+    fmg_groups: OrderedDict[str, List[PackageResult]] = OrderedDict()
     for pr in package_results:
         fmg_groups.setdefault(pr.fmg, []).append(pr)
 
@@ -523,7 +521,7 @@ def _html_package_cards(package_results: list[PackageResult]) -> str:
     return html
 
 
-def _html_findings_detail(package_results: list[PackageResult]) -> str:
+def _html_findings_detail(package_results: List[PackageResult]) -> str:
     """Render findings grouped by shadowed policy.
 
     Instead of one collapsible per finding (which explodes when a single
@@ -544,7 +542,7 @@ def _html_findings_detail(package_results: list[PackageResult]) -> str:
     html = f"<h2>Findings Detail ({total_findings} total)</h2>\n"
 
     # Group package results by FMG instance
-    fmg_groups: OrderedDict[str, list[PackageResult]] = OrderedDict()
+    fmg_groups: OrderedDict[str, List[PackageResult]] = OrderedDict()
     for pr in package_results:
         fmg_groups.setdefault(pr.fmg, []).append(pr)
 
@@ -859,7 +857,7 @@ def _html_footer() -> str:
 # Excel Report
 # ===================================================================
 
-def generate_excel_report(run_result: RunResult, output_path: str) -> str | None:
+def generate_excel_report(run_result: RunResult, output_path: str) -> Optional[str]:
     """Generate an Excel (.xlsx) report with multiple sheets.
 
     Returns the output file path, or None if openpyxl is unavailable.
@@ -895,7 +893,7 @@ _THIN_BORDER = Border(
     top=Side(style="thin"), bottom=Side(style="thin"),
 ) if HAS_OPENPYXL else None
 
-_SEVERITY_FILLS: dict[str, Any] = {}
+_SEVERITY_FILLS: Dict[str, Any] = {}
 if HAS_OPENPYXL:
     _SEVERITY_FILLS = {
         "CRITICAL": PatternFill(start_color="DC3545", end_color="DC3545", fill_type="solid"),
@@ -906,7 +904,7 @@ if HAS_OPENPYXL:
     }
 
 
-def _apply_header_row(ws, headers: list[str], widths: list[int] | None = None):
+def _apply_header_row(ws, headers: List[str], widths: Optional[List[int]]= None):
     """Write header row with formatting."""
     for col_idx, header in enumerate(headers, 1):
         cell = ws.cell(row=1, column=col_idx, value=header)
@@ -932,7 +930,7 @@ def _apply_header_row(ws, headers: list[str], widths: list[int] | None = None):
         ws.auto_filter.ref = f"A1:{last_col}1"
 
 
-def _write_row(ws, row_num: int, values: list, wrap_cols: set[int] | None = None):
+def _write_row(ws, row_num: int, values: list, wrap_cols: Optional[Set[int]]= None):
     """Write a data row."""
     for col_idx, val in enumerate(values, 1):
         cell = ws.cell(row=row_num, column=col_idx, value=val)
@@ -1170,8 +1168,8 @@ def _excel_policy_inventory_sheet(wb, run_result: RunResult):
 def generate_all_reports(
     run_result: RunResult,
     output_dir: str,
-    formats: list[str] | None = None,
-) -> dict[str, str]:
+    formats: Optional[List[str]]= None,
+) -> Dict[str, str]:
     """Generate reports in all requested formats.
 
     Args:
@@ -1191,7 +1189,7 @@ def generate_all_reports(
     timestamp_slug = (run_result.run_timestamp or datetime.now().isoformat()).replace(":", "-").replace(" ", "_")[:19]
     base = f"shadow_report_{timestamp_slug}"
 
-    results: dict[str, str] = {}
+    results: Dict[str, str] = {}
 
     for fmt in formats:
         fmt_lower = fmt.lower()

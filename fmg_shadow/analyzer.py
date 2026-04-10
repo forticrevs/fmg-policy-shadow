@@ -6,10 +6,8 @@ redundant, and conflicting rules using interval-based set operations
 across all match dimensions.
 """
 
-from __future__ import annotations
-
 import logging
-from typing import Optional
+from typing import Dict, List, Optional, Set
 
 from .models import (
     AddressSet,
@@ -43,9 +41,9 @@ class ShadowAnalyzer:
 
     def analyze_package(
         self,
-        policies: list[CanonicalPolicy],
+        policies: List[CanonicalPolicy],
         include_disabled: bool = False,
-    ) -> list[ShadowFinding]:
+    ) -> List[ShadowFinding]:
         """Analyze a list of policies (in evaluation order) for shadow relationships.
 
         Returns findings sorted by severity (critical first).
@@ -70,10 +68,10 @@ class ShadowAnalyzer:
         if len(effective) < 2:
             return []
 
-        findings: list[ShadowFinding] = []
+        findings: List[ShadowFinding] = []
         # Track which later rules already have a full pairwise shadow so we
         # can skip the more expensive composite check for them.
-        fully_shadowed: set[int] = set()
+        fully_shadowed: Set[int] = set()
 
         for j in range(1, len(effective)):
             later = effective[j]
@@ -235,7 +233,7 @@ class ShadowAnalyzer:
 
     def _composite_shadow_check(
         self,
-        earlier_policies: list[CanonicalPolicy],
+        earlier_policies: List[CanonicalPolicy],
         later: CanonicalPolicy,
     ) -> Optional[ShadowFinding]:
         """Check if the *union* of earlier rules fully covers later."""
@@ -395,12 +393,12 @@ class ShadowAnalyzer:
     def _compute_risk_score(
         self,
         finding: ShadowFinding,
-        earlier_policies: list[CanonicalPolicy],
+        earlier_policies: List[CanonicalPolicy],
         later: CanonicalPolicy,
     ) -> None:
         """Compute a weighted risk score (0-10) for a shadow finding."""
         score = 0.0
-        factors: list[str] = []
+        factors: List[str] = []
 
         # 1. Base score from finding type
         base_scores = {
@@ -485,7 +483,7 @@ class ShadowAnalyzer:
         self,
         earlier: CanonicalPolicy,
         later: CanonicalPolicy,
-    ) -> dict[str, bool]:
+    ) -> Dict[str, bool]:
         """Per-dimension: does earlier fully contain later?"""
         return {
             "srcintf": earlier.srcintf.contains(later.srcintf),
@@ -512,13 +510,13 @@ class ShadowAnalyzer:
         self,
         earlier: CanonicalPolicy,
         later: CanonicalPolicy,
-    ) -> dict[str, str]:
+    ) -> Dict[str, str]:
         """Human-readable per-dimension overlap descriptions.
 
         Includes both raw FMG object names and resolved IP/port values
         so operators can verify the resolution.
         """
-        desc: dict[str, str] = {}
+        desc: Dict[str, str] = {}
 
         # Helper: format "objects=[names] resolved=[ranges]" when names differ from resolved
         def _addr_label(policy: CanonicalPolicy, field: str, addr_set) -> str:
@@ -730,7 +728,7 @@ class ShadowAnalyzer:
     def _generate_composite_explanation(
         self,
         finding: ShadowFinding,
-        candidates: list[CanonicalPolicy],
+        candidates: List[CanonicalPolicy],
         later: CanonicalPolicy,
     ) -> str:
         """Full explanation for composite shadow findings.

@@ -5,8 +5,6 @@ Uses only Python stdlib (urllib, json, ssl) for zero-dependency operation.
 Supports session-based (user/passwd) and API-token authentication.
 """
 
-from __future__ import annotations
-
 import json
 import logging
 import ssl
@@ -14,7 +12,7 @@ import threading
 import time
 import urllib.request
 import urllib.error
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional
 
 log = logging.getLogger(__name__)
 
@@ -205,23 +203,23 @@ class FMGClient:
     def rpc(
         self,
         method: str,
-        params: list[dict[str, Any]],
+        params: List[Dict[str, Any]],
         timeout: Optional[int] = None,
-    ) -> list[dict[str, Any]]:
+    ) -> List[Dict[str, Any]]:
         """Execute a single JSON-RPC call with automatic retries.
 
         Parameters
         ----------
         method : str
             JSON-RPC method (``get``, ``set``, ``exec``, ``add``, …).
-        params : list[dict]
+        params : List[dict]
             List of param dicts (usually one element).
         timeout : int, optional
             Per-request timeout override.
 
         Returns
         -------
-        list[dict]
+        List[dict]
             The ``result`` list from the response.
 
         Raises
@@ -229,7 +227,7 @@ class FMGClient:
         FMGError
             On non-OK status codes after exhausting retries.
         """
-        payload: dict[str, Any] = {
+        payload: Dict[str, Any] = {
             "id": self._next_id(),
             "method": method,
             "params": params,
@@ -264,9 +262,9 @@ class FMGClient:
 
     def rpc_batch(
         self,
-        requests: list[dict[str, Any]],
+        requests: List[Dict[str, Any]],
         timeout: Optional[int] = None,
-    ) -> list[list[dict[str, Any]]]:
+    ) -> List[List[Dict[str, Any]]]:
         """Send multiple JSON-RPC objects in a single HTTP POST (JSON array).
 
         Each element in *requests* should be a dict with ``method`` and
@@ -275,19 +273,19 @@ class FMGClient:
 
         Parameters
         ----------
-        requests : list[dict]
-            Each dict must have ``method`` (str) and ``params`` (list[dict]).
+        requests : List[dict]
+            Each dict must have ``method`` (str) and ``params`` (List[dict]).
         timeout : int, optional
             Per-request timeout override.
 
         Returns
         -------
-        list[list[dict]]
+        List[List[dict]]
             List of result arrays, one per request in the batch.
         """
         payload = []
         for req in requests:
-            obj: dict[str, Any] = {
+            obj: Dict[str, Any] = {
                 "id": self._next_id(),
                 "method": req["method"],
                 "params": req["params"],
@@ -329,39 +327,39 @@ class FMGClient:
     def get(
         self,
         url: str,
-        fields: Optional[list[str]] = None,
+        fields: Optional[List[str]] = None,
         filter: Optional[list] = None,
-        option: Optional[list[str] | str] = None,
-        range_: Optional[list[int]] = None,
+        option: Optional[List[str] | str] = None,
+        range_: Optional[List[int]] = None,
         loadsub: Optional[int] = None,
-        expand_datasrc: Optional[list[dict[str, str]]] = None,
-        get_referred: Optional[list[dict[str, str]]] = None,
+        expand_datasrc: Optional[List[Dict[str, str]]] = None,
+        get_referred: Optional[List[Dict[str, str]]] = None,
         **kwargs: Any,
-    ) -> list[dict[str, Any]]:
+    ) -> List[Dict[str, Any]]:
         """High-level GET helper.
 
         Parameters
         ----------
         url : str
             FMG object URL, e.g. ``/pm/config/adom/root/pkg/…``.
-        fields : list[str], optional
+        fields : List[str], optional
             Restrict returned fields.
         filter : list, optional
             FMG filter expression (list of lists).
-        option : str or list[str], optional
+        option : str or List[str], optional
             Extra option flags (e.g. ``"object member"``).
-        range_ : list[int], optional
+        range_ : List[int], optional
             ``[start, count]`` for pagination.
         loadsub : int, optional
             Forwarded as the raw FMG ``loadsub`` request parameter.
-        expand_datasrc : list[dict], optional
+        expand_datasrc : List[dict], optional
             Datasource expansion list (added as ``"expand datasrc"``).
-        get_referred : list[dict], optional
+        get_referred : List[dict], optional
             Referred object expansion (FMG 7.4.3+, added as ``"get referred"``).
 
         Returns
         -------
-        list[dict]
+        List[dict]
             The ``data`` portion from the first result entry.
         """
         if "range" in kwargs and range_ is None:
@@ -370,7 +368,7 @@ class FMGClient:
             unexpected = ", ".join(sorted(kwargs.keys()))
             raise TypeError(f"FMGClient.get() got unexpected keyword argument(s): {unexpected}")
 
-        param: dict[str, Any] = {"url": url}
+        param: Dict[str, Any] = {"url": url}
         if fields is not None:
             param["fields"] = fields
         if filter is not None:
@@ -397,7 +395,7 @@ class FMGClient:
     # -- response validation ------------------------------------------------
 
     @staticmethod
-    def _check_response(resp: dict[str, Any]) -> list[dict[str, Any]]:
+    def _check_response(resp: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Validate a single JSON-RPC response and return its result list.
 
         Raises :class:`FMGError` when the response status code indicates
