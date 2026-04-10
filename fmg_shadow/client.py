@@ -12,7 +12,7 @@ import threading
 import time
 import urllib.request
 import urllib.error
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 log = logging.getLogger(__name__)
 
@@ -329,7 +329,7 @@ class FMGClient:
         url: str,
         fields: Optional[List[str]] = None,
         filter: Optional[list] = None,
-        option: Optional[List[str] | str] = None,
+        option: Optional[Union[List[str], str]] = None,
         range_: Optional[List[int]] = None,
         loadsub: Optional[int] = None,
         expand_datasrc: Optional[List[Dict[str, str]]] = None,
