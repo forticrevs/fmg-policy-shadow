@@ -6,10 +6,8 @@ resolves groups recursively, and normalizes everything into the
 canonical model types defined in models.py.
 """
 
-from __future__ import annotations
-
 import logging
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .models import (
     AddressSet,
@@ -42,7 +40,7 @@ _WEEKDAY_MAP = {
 }
 
 
-def _parse_port_range(spec: str) -> tuple[PortInterval, Optional[PortInterval]]:
+def _parse_port_range(spec: str) -> Tuple[PortInterval, Optional[PortInterval]]:
     """Parse FMG port range string like '80', '80-443', '80:1024-65535'.
 
     Returns (dst_ports, src_ports). src_ports is None if not specified.
@@ -70,10 +68,10 @@ def _parse_port_range(spec: str) -> tuple[PortInterval, Optional[PortInterval]]:
 def _paginated_fetch(
     client: Any,
     url: str,
-    option: Optional[list[str]] = None,
-) -> list[dict]:
+    option: Optional[List[str]] = None,
+) -> List[dict]:
     """Fetch all records from an FMG API endpoint with pagination."""
-    all_records: list[dict] = []
+    all_records: List[dict] = []
     offset = 0
     while True:
         range_ = [offset, _PAGE_SIZE]
@@ -96,9 +94,9 @@ def _paginated_fetch(
     return all_records
 
 
-def _to_dict_by_name(records: list[dict]) -> dict[str, dict]:
+def _to_dict_by_name(records: List[dict]) -> Dict[str, dict]:
     """Index a list of FMG objects by their 'name' field."""
-    result: dict[str, dict] = {}
+    result: Dict[str, dict] = {}
     for rec in records:
         name = rec.get("name")
         if name:
@@ -114,28 +112,34 @@ class ObjectResolver:
         self.adom = adom
 
         # Object caches (populated on first access)
-        self._addresses: Optional[dict[str, dict]] = None
-        self._addrgroups: Optional[dict[str, dict]] = None
-        self._vips: Optional[dict[str, dict]] = None
-        self._vipgroups: Optional[dict[str, dict]] = None
-        self._services: Optional[dict[str, dict]] = None
-        self._service_groups: Optional[dict[str, dict]] = None
-        self._sched_onetime: Optional[dict[str, dict]] = None
-        self._sched_recurring: Optional[dict[str, dict]] = None
-        self._sched_groups: Optional[dict[str, dict]] = None
-        self._internet_service_names: Optional[dict[str, dict]] = None
-        self._isdb_services: Optional[dict[int, dict]] = None  # id -> {name, entry_count, ...}
+        self._addresses: Optional[Dict[str, dict]] = None
+        self._addrgroups: Optional[Dict[str, dict]] = None
+        self._vips: Optional[Dict[str, dict]] = None
+        self._vipgroups: Optional[Dict[str, dict]] = None
+        self._services: Optional[Dict[str, dict]] = None
+        self._service_groups: Optional[Dict[str, dict]] = None
+        self._sched_onetime: Optional[Dict[str, dict]] = None
+        self._sched_recurring: Optional[Dict[str, dict]] = None
+        self._sched_groups: Optional[Dict[str, dict]] = None
+        self._internet_service_names: Optional[Dict[str, dict]] = None
+        self._isdb_services: Optional[Dict[int, dict]] = None  # id -> {name, entry_count, ...}
 
         # Resolution caches (memoize resolved objects)
-        self._addr_cache: dict[str, AddressSet] = {}
-        self._svc_cache: dict[str, ServiceSet] = {}
-        self._sched_cache: dict[str, ScheduleSpec] = {}
+        self._addr_cache: Dict[str, AddressSet] = {}
+        self._svc_cache: Dict[str, ServiceSet] = {}
+        self._sched_cache: Dict[str, ScheduleSpec] = {}
+
+        # Guard so fetch_all() runs at most once.  The resolver is shared across
+        # all packages in an ADOM, so re-fetching every object catalogue per
+        # package (once by the orchestrator, again from resolve_policies) is
+        # wasteful — this makes the bulk fetch idempotent.
+        self._fetched_all = False
 
     # ------------------------------------------------------------------
     # Bulk fetch methods
     # ------------------------------------------------------------------
 
-    def fetch_all_addresses(self, adom: Optional[str] = None) -> dict[str, dict]:
+    def fetch_all_addresses(self, adom: Optional[str] = None) -> Dict[str, dict]:
         """Bulk fetch all firewall address objects."""
         adom = adom or self.adom
         url = f"/pm/config/adom/{adom}/obj/firewall/address"
@@ -144,7 +148,7 @@ class ObjectResolver:
         logger.info("Fetched %d address objects for adom=%s", len(self._addresses), adom)
         return self._addresses
 
-    def fetch_all_addrgroups(self, adom: Optional[str] = None) -> dict[str, dict]:
+    def fetch_all_addrgroups(self, adom: Optional[str] = None) -> Dict[str, dict]:
         """Bulk fetch all firewall address group objects."""
         adom = adom or self.adom
         url = f"/pm/config/adom/{adom}/obj/firewall/addrgrp"
@@ -153,7 +157,7 @@ class ObjectResolver:
         logger.info("Fetched %d address groups for adom=%s", len(self._addrgroups), adom)
         return self._addrgroups
 
-    def fetch_all_vips(self, adom: Optional[str] = None) -> dict[str, dict]:
+    def fetch_all_vips(self, adom: Optional[str] = None) -> Dict[str, dict]:
         """Bulk fetch all firewall VIP objects."""
         adom = adom or self.adom
         url = f"/pm/config/adom/{adom}/obj/firewall/vip"
@@ -162,7 +166,7 @@ class ObjectResolver:
         logger.info("Fetched %d VIP objects for adom=%s", len(self._vips), adom)
         return self._vips
 
-    def fetch_all_vipgroups(self, adom: Optional[str] = None) -> dict[str, dict]:
+    def fetch_all_vipgroups(self, adom: Optional[str] = None) -> Dict[str, dict]:
         """Bulk fetch all firewall VIP group objects."""
         adom = adom or self.adom
         url = f"/pm/config/adom/{adom}/obj/firewall/vipgrp"
@@ -171,7 +175,7 @@ class ObjectResolver:
         logger.info("Fetched %d VIP groups for adom=%s", len(self._vipgroups), adom)
         return self._vipgroups
 
-    def fetch_all_internet_service_names(self, adom: Optional[str] = None) -> dict[str, dict]:
+    def fetch_all_internet_service_names(self, adom: Optional[str] = None) -> Dict[str, dict]:
         """Bulk fetch all internet-service-name (ISDB) objects."""
         adom = adom or self.adom
         url = f"/pm/config/adom/{adom}/obj/firewall/internet-service-name"
@@ -183,7 +187,7 @@ class ObjectResolver:
         )
         return self._internet_service_names
 
-    def fetch_internet_service_db(self, adom: Optional[str] = None) -> dict[int, dict]:
+    def fetch_internet_service_db(self, adom: Optional[str] = None) -> Dict[int, dict]:
         """Fetch the internet-service database (ID -> name/metadata mapping)."""
         adom = adom or self.adom
         url = f"/pm/config/adom/{adom}/_fdsdb/internet-service"
@@ -199,7 +203,7 @@ class ObjectResolver:
         )
         return self._isdb_services
 
-    def fetch_all_services(self, adom: Optional[str] = None) -> dict[str, dict]:
+    def fetch_all_services(self, adom: Optional[str] = None) -> Dict[str, dict]:
         """Bulk fetch all firewall service/custom objects."""
         adom = adom or self.adom
         url = f"/pm/config/adom/{adom}/obj/firewall/service/custom"
@@ -208,7 +212,7 @@ class ObjectResolver:
         logger.info("Fetched %d service objects for adom=%s", len(self._services), adom)
         return self._services
 
-    def fetch_all_service_groups(self, adom: Optional[str] = None) -> dict[str, dict]:
+    def fetch_all_service_groups(self, adom: Optional[str] = None) -> Dict[str, dict]:
         """Bulk fetch all firewall service group objects."""
         adom = adom or self.adom
         url = f"/pm/config/adom/{adom}/obj/firewall/service/group"
@@ -217,7 +221,7 @@ class ObjectResolver:
         logger.info("Fetched %d service groups for adom=%s", len(self._service_groups), adom)
         return self._service_groups
 
-    def fetch_all_schedules(self, adom: Optional[str] = None) -> dict[str, dict]:
+    def fetch_all_schedules(self, adom: Optional[str] = None) -> Dict[str, dict]:
         """Bulk fetch all schedule objects (onetime + recurring + group)."""
         adom = adom or self.adom
 
@@ -240,14 +244,16 @@ class ObjectResolver:
         logger.info("Fetched %d schedule objects for adom=%s", total, adom)
 
         # Return a merged dict for convenience
-        merged: dict[str, dict] = {}
+        merged: Dict[str, dict] = {}
         merged.update(self._sched_onetime)
         merged.update(self._sched_recurring)
         merged.update(self._sched_groups)
         return merged
 
     def fetch_all(self) -> None:
-        """Fetch all object types for the configured ADOM."""
+        """Fetch all object types for the configured ADOM (idempotent)."""
+        if self._fetched_all:
+            return
         self.fetch_all_addresses()
         self.fetch_all_addrgroups()
         self.fetch_all_vips()
@@ -257,6 +263,7 @@ class ObjectResolver:
         self.fetch_all_services()
         self.fetch_all_service_groups()
         self.fetch_all_schedules()
+        self._fetched_all = True
 
     # ------------------------------------------------------------------
     # Ensure caches are populated
@@ -522,7 +529,7 @@ class ObjectResolver:
         if isinstance(extip, str):
             extip = [extip]
 
-        intervals: list[IPInterval] = []
+        intervals: List[IPInterval] = []
         for entry in extip:
             entry = entry.strip()
             if not entry:
@@ -558,7 +565,7 @@ class ObjectResolver:
                 result = result.union(member_set)
         return result
 
-    def resolve_address_list(self, names: list[str]) -> AddressSet:
+    def resolve_address_list(self, names: List[str]) -> AddressSet:
         """Resolve a list of address names and union the results."""
         if not names:
             return AddressSet.empty()
@@ -620,7 +627,7 @@ class ObjectResolver:
     def _resolve_service_obj(self, obj: dict) -> ServiceSet:
         """Resolve a single FMG service object to a ServiceSet."""
         protocol = obj.get("protocol", "")
-        specs: list[ServiceSpec] = []
+        specs: List[ServiceSpec] = []
         name = obj.get("name", "unknown")
 
         # protocol 5 = TCP/UDP/SCTP
@@ -736,8 +743,8 @@ class ObjectResolver:
         if isinstance(members, str):
             members = [members]
 
-        all_specs: list[ServiceSpec] = []
-        unresolved: list[str] = []
+        all_specs: List[ServiceSpec] = []
+        unresolved: List[str] = []
         is_any = False
 
         for member_name in members:
@@ -755,13 +762,13 @@ class ObjectResolver:
         result.unresolved_names = list(set(unresolved))
         return result
 
-    def resolve_service_list(self, names: list[str]) -> ServiceSet:
+    def resolve_service_list(self, names: List[str]) -> ServiceSet:
         """Resolve a list of service names and union the results."""
         if not names:
             return ServiceSet.empty()
 
-        all_specs: list[ServiceSpec] = []
-        unresolved: list[str] = []
+        all_specs: List[ServiceSpec] = []
+        unresolved: List[str] = []
         is_any = False
 
         for name in names:
@@ -840,7 +847,7 @@ class ObjectResolver:
         if isinstance(day_field, str):
             day_field = [day_field]
 
-        weekdays: set[int] = set()
+        weekdays: Set[int] = set()
         for d in day_field:
             if isinstance(d, str):
                 idx = _WEEKDAY_MAP.get(d.lower())
@@ -895,7 +902,7 @@ class ObjectResolver:
             members = [members]
 
         name = grp_obj.get("name", "unknown")
-        resolved_members: list[ScheduleSpec] = []
+        resolved_members: List[ScheduleSpec] = []
 
         for member_name in members:
             if isinstance(member_name, str):
@@ -928,7 +935,7 @@ class ObjectResolver:
     # Bulk policy resolution
     # ------------------------------------------------------------------
 
-    def resolve_policies(self, policies: list[CanonicalPolicy]) -> list[CanonicalPolicy]:
+    def resolve_policies(self, policies: List[CanonicalPolicy]) -> List[CanonicalPolicy]:
         """Resolve all object references in a list of policies in-place.
 
         Assumes raw_data on each policy contains the original FMG fields:
@@ -1006,7 +1013,7 @@ class ObjectResolver:
         return f"ISDB:{name}"
 
     @staticmethod
-    def _extract_isdb_names(raw: dict, src: bool = False) -> list[str]:
+    def _extract_isdb_names(raw: dict, src: bool = False) -> List[str]:
         """Extract internet-service-name entries from raw policy data.
 
         Returns a list of ISDB entry name strings.
@@ -1023,7 +1030,7 @@ class ObjectResolver:
         if isinstance(field, (int, float)):
             return [str(int(field))]
         if isinstance(field, list):
-            names: list[str] = []
+            names: List[str] = []
             for item in field:
                 if isinstance(item, str):
                     if item:
@@ -1098,7 +1105,7 @@ class ObjectResolver:
         policy.schedule = self.resolve_schedule(sched_name)
 
         # Track unresolved state
-        unresolved_parts: list[str] = []
+        unresolved_parts: List[str] = []
         if policy.srcaddr.unresolved_names:
             unresolved_parts.extend(
                 f"srcaddr:{n}" for n in policy.srcaddr.unresolved_names

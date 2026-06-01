@@ -137,6 +137,7 @@ Normalized internal forms include:
 
 - preserves raw references for later object resolution
 - extracts **security profile assignments** (av-profile, webfilter-profile, ips-sensor, application-list, ssl-ssh-profile, dnsfilter-profile, emailfilter-profile, dlp-profile, file-filter-profile, voip-profile, casb-profile, waf-profile, profile-protocol-options, utm-status)
+- **factors in global header/footer policies inherited from the global database.** When a global policy package is assigned to an ADOM package, FortiManager evaluates rules in the order `global headers → local package policies → global footers`. The analyzer fetches the per-package global header/footer policies (`/pm/config/adom/{adom}/pkg/{pkg}/global/{header,footer}/policy`), splices them into a single ordered list, and renumbers the evaluation sequence so a global header can shadow a local rule and a global footer can be shadowed by anything above it. Each policy and finding records its origin (`local`, `global-header`, `global-footer`), surfaced across all report formats. Global objects (`g`-prefixed) referenced by these policies resolve via the standard ADOM object database. Use `--no-global-policies` to analyze local policies only.
 
 ### 5) Analysis engine
 
@@ -386,6 +387,7 @@ python3 run_shadow.py --fmg 10.0.0.1 --adom root --all-packages --insecure
 --workers           concurrent package workers (default: 4)
 --include-disabled  include disabled rules in analysis
 --strict-unsupported fail instead of flagging unresolved semantics
+--no-global-policies skip global header/footer policies (default: included)
 --insecure          disable certificate verification
 --no-insecure       enforce certificate verification
 --verbose           info logging

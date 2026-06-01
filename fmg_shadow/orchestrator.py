@@ -6,14 +6,13 @@ Coordinates FMG client connections, package discovery, policy fetching,
 object resolution, and shadow analysis across multiple FMG instances.
 """
 
-from __future__ import annotations
-
 import gc
 import logging
 import time
 from datetime import datetime, timezone
 
 from fmg_shadow.models import PackageResult, RunResult
+from typing import List, Optional
 
 logger = logging.getLogger("fmg_shadow.orchestrator")
 
@@ -23,7 +22,7 @@ def analyze_single_package(
     adom: str,
     package_name: str,
     config: dict,
-    group_map: dict | None = None,
+    group_map: Optional[dict]= None,
     shared_resolver=None,
 ) -> PackageResult:
     """
@@ -43,7 +42,7 @@ def analyze_single_package(
     """
     from fmg_shadow.analyzer import ShadowAnalyzer
     from fmg_shadow.objects import ObjectResolver
-    from fmg_shadow.policy_fetch import fetch_policies
+    from fmg_shadow.policy_fetch import fetch_global_policies, fetch_policies
 
     fmg_host = client.host if hasattr(client, "host") else str(client)
     result = PackageResult(
@@ -57,8 +56,38 @@ def analyze_single_package(
         # 1. Fetch raw policies
         logger.info("[%s] Fetching policies from %s/%s ...", fmg_host, adom, package_name)
         include_disabled = config.get("include_disabled", False)
-        policies = fetch_policies(client, adom, package_name, include_disabled, group_map=group_map)
+        local_policies = fetch_policies(client, adom, package_name, include_disabled, group_map=group_map)
+
+        # 1b. Fetch global header/footer policies inherited from the global
+        #     database.  On the FortiGate these are evaluated as:
+        #       global headers -> local package policies -> global footers
+        #     so we splice them into a single ordered list and renumber the
+        #     evaluation sequence to match.  This lets a global header shadow a
+        #     local rule, and a local rule (or header) shadow a global footer.
+        header_policies = []
+        footer_policies = []
+        if config.get("include_global_policies", True):
+            header_policies = fetch_global_policies(
+                client, adom, package_name, "global-header", group_map=group_map
+            )
+            footer_policies = fetch_global_policies(
+                client, adom, package_name, "global-footer", group_map=group_map
+            )
+
+        policies = header_policies + local_policies + footer_policies
+        # Renumber to reflect the combined top-to-bottom evaluation order.
+        for idx, p in enumerate(policies):
+            p.seq_num = idx
+
         result.total_policies = len(policies)
+        result.global_header_policies = len(header_policies)
+        result.global_footer_policies = len(footer_policies)
+        if header_policies or footer_policies:
+            logger.info(
+                "[%s] %s/%s: %d global header + %d local + %d global footer policies",
+                fmg_host, adom, package_name,
+                len(header_policies), len(local_policies), len(footer_policies),
+            )
 
         if not policies:
             logger.warning("[%s] No policies found in %s/%s", fmg_host, adom, package_name)
@@ -146,7 +175,7 @@ def _slim_raw_data(policies) -> None:
         p.raw_data = slim
 
 
-def _discover_packages(client, adom: str, config: dict) -> list[str]:
+def _discover_packages(client, adom: str, config: dict) -> List[str]:
     """
     Discover and filter packages based on config.
 
@@ -263,7 +292,7 @@ def run_analysis(config: dict) -> RunResult:
                 # Concurrent execution is removed — the bottleneck is
                 # API latency (already amortized by the shared resolver)
                 # and memory, not CPU.
-                package_results: list[PackageResult] = []
+                package_results: List[PackageResult] = []
 
                 for i, pkg_name in enumerate(package_names, 1):
                     logger.info(

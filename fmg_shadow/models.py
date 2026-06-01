@@ -5,19 +5,17 @@ All FMG objects are normalized into these representations for
 accurate, vendor-agnostic comparison.
 """
 
-from __future__ import annotations
-
 import ipaddress
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Dict, List, Optional, Set, Tuple
 
 
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 
 # ---------------------------------------------------------------------------
@@ -209,10 +207,10 @@ class AddressSet:
     A set of IP intervals representing the union of address space.
     Supports set operations for shadow analysis.
     """
-    intervals: list[IPInterval] = field(default_factory=list)
+    intervals: List[IPInterval] = field(default_factory=list)
     is_any: bool = False
     # Track unresolvable components
-    unresolved_names: list[str] = field(default_factory=list)
+    unresolved_names: List[str] = field(default_factory=list)
 
     @classmethod
     def any(cls) -> "AddressSet":
@@ -223,7 +221,7 @@ class AddressSet:
         return cls(intervals=[])
 
     @classmethod
-    def from_intervals(cls, intervals: list[IPInterval]) -> "AddressSet":
+    def from_intervals(cls, intervals: List[IPInterval]) -> "AddressSet":
         s = cls(intervals=sorted(intervals))
         s._merge()
         return s
@@ -367,9 +365,9 @@ class AddressSet:
 @dataclass
 class ServiceSet:
     """A set of service specs."""
-    specs: list[ServiceSpec] = field(default_factory=list)
+    specs: List[ServiceSpec] = field(default_factory=list)
     is_any: bool = False
-    unresolved_names: list[str] = field(default_factory=list)
+    unresolved_names: List[str] = field(default_factory=list)
 
     @classmethod
     def any(cls) -> "ServiceSet":
@@ -432,7 +430,7 @@ class ServiceSet:
 @dataclass
 class InterfaceSet:
     """A set of interface names. 'any' means all interfaces."""
-    names: set[str] = field(default_factory=set)
+    names: Set[str] = field(default_factory=set)
     is_any: bool = False
 
     @classmethod
@@ -440,7 +438,7 @@ class InterfaceSet:
         return cls(names=set(), is_any=True)
 
     @classmethod
-    def from_names(cls, names: list[str]) -> "InterfaceSet":
+    def from_names(cls, names: List[str]) -> "InterfaceSet":
         normalized = set()
         for n in names:
             n = n.strip().lower()
@@ -490,7 +488,7 @@ class ScheduleSpec:
     """
     is_always: bool = False
     # Recurring
-    weekdays: Optional[set[int]] = None  # 0=Sunday...6=Saturday
+    weekdays: Optional[Set[int]] = None  # 0=Sunday...6=Saturday
     start_time: Optional[str] = None     # "HH:MM"
     end_time: Optional[str] = None       # "HH:MM"
     # Onetime
@@ -569,7 +567,7 @@ class InstallScope:
     Otherwise, targets is a set of (device_name, vdom) tuples.
     """
     is_global: bool = True
-    targets: set[tuple[str, str]] = field(default_factory=set)
+    targets: Set[Tuple[str, str]] = field(default_factory=set)
 
     @classmethod
     def global_scope(cls) -> "InstallScope":
@@ -578,8 +576,8 @@ class InstallScope:
     @classmethod
     def from_scope_members(
         cls,
-        members: list[dict],
-        group_map: Optional[dict[str, set[tuple[str, str]]]] = None,
+        members: List[dict],
+        group_map: Optional[Dict[str, Set[Tuple[str, str]]]] = None,
     ) -> "InstallScope":
         if not members:
             return cls.global_scope()
@@ -690,12 +688,17 @@ class CanonicalPolicy:
     comments: str = ""
     raw_data: dict = field(default_factory=dict)
 
+    # Origin within the effective evaluation order.  Local package policies are
+    # "local"; policies inherited from the global database are "global-header"
+    # (evaluated before all local rules) or "global-footer" (evaluated after).
+    policy_section: str = "local"
+
     # Security profiles (UTM inspection profiles)
-    security_profiles: dict[str, str] = field(default_factory=dict)
+    security_profiles: Dict[str, str] = field(default_factory=dict)
 
     # Flags for unresolved/unsupported elements
     has_unresolved: bool = False
-    unresolved_notes: list[str] = field(default_factory=list)
+    unresolved_notes: List[str] = field(default_factory=list)
 
     def is_effective(self, include_disabled: bool = False) -> bool:
         """Is this policy part of the active evaluation chain?"""
@@ -708,7 +711,12 @@ class CanonicalPolicy:
     def label(self) -> str:
         """Human-readable label for this policy."""
         name_part = f" ({self.name})" if self.name else ""
-        return f"#{self.seq_num+1} policyid={self.policyid}{name_part}"
+        section_part = ""
+        if self.policy_section == "global-header":
+            section_part = "[global-header] "
+        elif self.policy_section == "global-footer":
+            section_part = "[global-footer] "
+        return f"{section_part}#{self.seq_num+1} policyid={self.policyid}{name_part}"
 
 
 # ---------------------------------------------------------------------------
@@ -745,15 +753,17 @@ class ShadowFinding:
     shadowed_policyid: int = 0
     shadowed_name: str = ""
     shadowed_seq: int = 0
+    shadowed_section: str = "local"  # local / global-header / global-footer
 
     # Classification
     finding_type: FindingType = FindingType.INDETERMINATE
     is_composite: bool = False  # multiple earlier rules needed
 
     # Shadowing rule(s)
-    shadowing_policyids: list[int] = field(default_factory=list)
-    shadowing_names: list[str] = field(default_factory=list)
-    shadowing_seqs: list[int] = field(default_factory=list)
+    shadowing_policyids: List[int] = field(default_factory=list)
+    shadowing_names: List[str] = field(default_factory=list)
+    shadowing_seqs: List[int] = field(default_factory=list)
+    shadowing_sections: List[str] = field(default_factory=list)
 
     # Dimension overlap details
     srcintf_overlap: str = ""
@@ -774,14 +784,14 @@ class ShadowFinding:
 
     # Confidence
     confidence: Confidence = Confidence.HIGH
-    unsupported_notes: list[str] = field(default_factory=list)
+    unsupported_notes: List[str] = field(default_factory=list)
 
     # Explanation
     explanation: str = ""
 
     # Risk scoring
     risk_score: float = 0.0
-    risk_factors: list[str] = field(default_factory=list)
+    risk_factors: List[str] = field(default_factory=list)
 
     def severity_label(self) -> str:
         # Base severity from finding type (industry-aligned classifications)
@@ -821,11 +831,13 @@ class ShadowFinding:
             "shadowed_policyid": self.shadowed_policyid,
             "shadowed_name": self.shadowed_name,
             "shadowed_seq": self.shadowed_seq,
+            "shadowed_section": self.shadowed_section,
             "finding_type": self.finding_type.value,
             "is_composite": self.is_composite,
             "shadowing_policyids": self.shadowing_policyids,
             "shadowing_names": self.shadowing_names,
             "shadowing_seqs": self.shadowing_seqs,
+            "shadowing_sections": self.shadowing_sections,
             "srcintf_overlap": self.srcintf_overlap,
             "dstintf_overlap": self.dstintf_overlap,
             "srcaddr_overlap": self.srcaddr_overlap,
@@ -858,10 +870,15 @@ class PackageResult:
     package: str = ""
     total_policies: int = 0
     effective_policies: int = 0
-    findings: list[ShadowFinding] = field(default_factory=list)
-    policies: list[CanonicalPolicy] = field(default_factory=list)
-    unsupported_objects: list[str] = field(default_factory=list)
-    errors: list[str] = field(default_factory=list)
+    # Breakdown of where the analyzed policies came from.  total_policies
+    # includes global header + local + global footer; local can be derived as
+    # total - global_header_policies - global_footer_policies.
+    global_header_policies: int = 0
+    global_footer_policies: int = 0
+    findings: List[ShadowFinding] = field(default_factory=list)
+    policies: List[CanonicalPolicy] = field(default_factory=list)
+    unsupported_objects: List[str] = field(default_factory=list)
+    errors: List[str] = field(default_factory=list)
     elapsed_seconds: float = 0.0
 
     @property
@@ -894,8 +911,8 @@ class RunResult:
     """Aggregate results for the entire analysis run."""
     tool_version: str = __version__
     run_timestamp: str = ""
-    package_results: list[PackageResult] = field(default_factory=list)
-    errors: list[str] = field(default_factory=list)
+    package_results: List[PackageResult] = field(default_factory=list)
+    errors: List[str] = field(default_factory=list)
     elapsed_seconds: float = 0.0
 
     @property

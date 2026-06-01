@@ -1,6 +1,10 @@
-# FMG Policy Shadow Analyzer — runtime dependencies
+# FMG Policy Shadow Analyzer — runtime dependencies (python3.6-compat branch)
 #
-# The core tool has ZERO mandatory third-party dependencies (stdlib only).
-# The optional dependency below enables Excel (.xlsx) report generation.
+# This branch targets Python 3.6.x environments that cannot be upgraded.
+# `dataclasses` is a stdlib module in Python 3.7+, so the backport is only
+# pulled in on 3.6.
+#
+# The optional openpyxl dependency enables Excel (.xlsx) report generation.
 
+dataclasses; python_version < "3.7"
 openpyxl>=3.1.0        # optional — Excel export (HTML + JSON work without it)

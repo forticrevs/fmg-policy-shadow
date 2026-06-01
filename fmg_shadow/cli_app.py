@@ -5,8 +5,6 @@ CLI entry point for FMG Policy Shadow Analyzer.
 Parses command-line arguments and delegates to the orchestrator.
 """
 
-from __future__ import annotations
-
 import argparse
 import logging
 import os
@@ -14,6 +12,7 @@ import sys
 from pathlib import Path
 
 from fmg_shadow.models import __version__
+from typing import List, Optional
 
 
 logger = logging.getLogger("fmg_shadow")
@@ -139,6 +138,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fail on unsupported objects instead of flagging them.",
     )
     exec_group.add_argument(
+        "--no-global-policies",
+        action="store_false",
+        dest="include_global_policies",
+        default=True,
+        help=(
+            "Do not factor in global header/footer policies inherited from the "
+            "global database (default: included in the evaluation order)."
+        ),
+    )
+    exec_group.add_argument(
         "--insecure",
         action="store_true",
         default=True,
@@ -175,9 +184,9 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _resolve_fmg_hosts(args: argparse.Namespace) -> list[str]:
+def _resolve_fmg_hosts(args: argparse.Namespace) -> List[str]:
     """Collect FMG hosts from --fmg and --fmg-file arguments."""
-    hosts: list[str] = []
+    hosts: List[str] = []
 
     if args.fmg:
         for entry in args.fmg:
@@ -217,7 +226,7 @@ def _configure_logging(verbose: bool, debug: bool) -> None:
     logging.getLogger("urllib3").setLevel(logging.ERROR)
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(argv: Optional[List[str]]= None) -> None:
     """Parse CLI arguments and run the shadow analysis."""
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -270,6 +279,7 @@ def main(argv: list[str] | None = None) -> None:
         "formats": formats,
         "include_disabled": args.include_disabled,
         "strict_unsupported": args.strict_unsupported,
+        "include_global_policies": args.include_global_policies,
         "verify_ssl": not args.insecure,
         "verbose": args.verbose,
         "debug": args.debug,
