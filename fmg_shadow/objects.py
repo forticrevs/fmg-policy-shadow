@@ -129,6 +129,12 @@ class ObjectResolver:
         self._svc_cache: Dict[str, ServiceSet] = {}
         self._sched_cache: Dict[str, ScheduleSpec] = {}
 
+        # Guard so fetch_all() runs at most once.  The resolver is shared across
+        # all packages in an ADOM, so re-fetching every object catalogue per
+        # package (once by the orchestrator, again from resolve_policies) is
+        # wasteful — this makes the bulk fetch idempotent.
+        self._fetched_all = False
+
     # ------------------------------------------------------------------
     # Bulk fetch methods
     # ------------------------------------------------------------------
@@ -245,7 +251,9 @@ class ObjectResolver:
         return merged
 
     def fetch_all(self) -> None:
-        """Fetch all object types for the configured ADOM."""
+        """Fetch all object types for the configured ADOM (idempotent)."""
+        if self._fetched_all:
+            return
         self.fetch_all_addresses()
         self.fetch_all_addrgroups()
         self.fetch_all_vips()
@@ -255,6 +263,7 @@ class ObjectResolver:
         self.fetch_all_services()
         self.fetch_all_service_groups()
         self.fetch_all_schedules()
+        self._fetched_all = True
 
     # ------------------------------------------------------------------
     # Ensure caches are populated

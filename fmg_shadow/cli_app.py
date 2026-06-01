@@ -138,6 +138,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fail on unsupported objects instead of flagging them.",
     )
     exec_group.add_argument(
+        "--no-global-policies",
+        action="store_false",
+        dest="include_global_policies",
+        default=True,
+        help=(
+            "Do not factor in global header/footer policies inherited from the "
+            "global database (default: included in the evaluation order)."
+        ),
+    )
+    exec_group.add_argument(
         "--insecure",
         action="store_true",
         default=True,
@@ -269,6 +279,7 @@ def main(argv: Optional[List[str]]= None) -> None:
         "formats": formats,
         "include_disabled": args.include_disabled,
         "strict_unsupported": args.strict_unsupported,
+        "include_global_policies": args.include_global_policies,
         "verify_ssl": not args.insecure,
         "verbose": args.verbose,
         "debug": args.debug,

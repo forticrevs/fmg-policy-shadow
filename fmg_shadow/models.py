@@ -15,7 +15,7 @@ from typing import Dict, List, Optional, Set, Tuple
 # Version
 # ---------------------------------------------------------------------------
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 
 # ---------------------------------------------------------------------------
@@ -688,6 +688,11 @@ class CanonicalPolicy:
     comments: str = ""
     raw_data: dict = field(default_factory=dict)
 
+    # Origin within the effective evaluation order.  Local package policies are
+    # "local"; policies inherited from the global database are "global-header"
+    # (evaluated before all local rules) or "global-footer" (evaluated after).
+    policy_section: str = "local"
+
     # Security profiles (UTM inspection profiles)
     security_profiles: Dict[str, str] = field(default_factory=dict)
 
@@ -706,7 +711,12 @@ class CanonicalPolicy:
     def label(self) -> str:
         """Human-readable label for this policy."""
         name_part = f" ({self.name})" if self.name else ""
-        return f"#{self.seq_num+1} policyid={self.policyid}{name_part}"
+        section_part = ""
+        if self.policy_section == "global-header":
+            section_part = "[global-header] "
+        elif self.policy_section == "global-footer":
+            section_part = "[global-footer] "
+        return f"{section_part}#{self.seq_num+1} policyid={self.policyid}{name_part}"
 
 
 # ---------------------------------------------------------------------------
@@ -743,6 +753,7 @@ class ShadowFinding:
     shadowed_policyid: int = 0
     shadowed_name: str = ""
     shadowed_seq: int = 0
+    shadowed_section: str = "local"  # local / global-header / global-footer
 
     # Classification
     finding_type: FindingType = FindingType.INDETERMINATE
@@ -752,6 +763,7 @@ class ShadowFinding:
     shadowing_policyids: List[int] = field(default_factory=list)
     shadowing_names: List[str] = field(default_factory=list)
     shadowing_seqs: List[int] = field(default_factory=list)
+    shadowing_sections: List[str] = field(default_factory=list)
 
     # Dimension overlap details
     srcintf_overlap: str = ""
@@ -819,11 +831,13 @@ class ShadowFinding:
             "shadowed_policyid": self.shadowed_policyid,
             "shadowed_name": self.shadowed_name,
             "shadowed_seq": self.shadowed_seq,
+            "shadowed_section": self.shadowed_section,
             "finding_type": self.finding_type.value,
             "is_composite": self.is_composite,
             "shadowing_policyids": self.shadowing_policyids,
             "shadowing_names": self.shadowing_names,
             "shadowing_seqs": self.shadowing_seqs,
+            "shadowing_sections": self.shadowing_sections,
             "srcintf_overlap": self.srcintf_overlap,
             "dstintf_overlap": self.dstintf_overlap,
             "srcaddr_overlap": self.srcaddr_overlap,
@@ -856,6 +870,11 @@ class PackageResult:
     package: str = ""
     total_policies: int = 0
     effective_policies: int = 0
+    # Breakdown of where the analyzed policies came from.  total_policies
+    # includes global header + local + global footer; local can be derived as
+    # total - global_header_policies - global_footer_policies.
+    global_header_policies: int = 0
+    global_footer_policies: int = 0
     findings: List[ShadowFinding] = field(default_factory=list)
     policies: List[CanonicalPolicy] = field(default_factory=list)
     unsupported_objects: List[str] = field(default_factory=list)

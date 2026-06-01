@@ -62,6 +62,13 @@ FINDING_TYPE_COLORS = {
     "indeterminate_due_to_unsupported_objects": "#adb5bd",
 }
 
+# Human-readable labels for a policy's origin in the evaluation order.
+_SECTION_LABELS = {
+    "local": "Local",
+    "global-header": "Global Header",
+    "global-footer": "Global Footer",
+}
+
 
 # ===================================================================
 # JSON Report
@@ -87,6 +94,8 @@ def generate_json_report(run_result: RunResult, output_path: str) -> str:
             "adom": pr.adom,
             "package": pr.package,
             "total_policies": pr.total_policies,
+            "global_header_policies": pr.global_header_policies,
+            "global_footer_policies": pr.global_footer_policies,
             "effective_policies": pr.effective_policies,
             "elapsed_seconds": pr.elapsed_seconds,
             "finding_counts": {
@@ -120,6 +129,7 @@ def _serialize_policies(policies: List[CanonicalPolicy]) -> List[dict]:
             "policyid": p.policyid,
             "name": p.name,
             "seq_num": p.seq_num,
+            "policy_section": p.policy_section,
             "action": p.action.value if p.action else "",
             "status": p.status,
             "comments": p.comments,
@@ -199,6 +209,22 @@ def _finding_type_badge(ftype: str) -> str:
     return (
         f'<span style="display:inline-block;padding:2px 8px;border-radius:4px;'
         f'font-size:0.8em;color:#fff;background-color:{color}">{_esc(label)}</span>'
+    )
+
+
+def _section_badge(section: str) -> str:
+    """Small badge flagging a policy inherited from the global database.
+
+    Returns an empty string for local policies so the common case stays
+    uncluttered.
+    """
+    if section not in ("global-header", "global-footer"):
+        return ""
+    label = _SECTION_LABELS.get(section, section)
+    return (
+        f'<span style="display:inline-block;padding:1px 6px;border-radius:4px;'
+        f'font-size:0.72em;font-weight:600;color:#fff;background-color:#6610f2;'
+        f'margin-left:4px;">{_esc(label)}</span>'
     )
 
 
@@ -497,12 +523,25 @@ def _html_package_cards(package_results: List[PackageResult]) -> str:
             border_color = "#dc3545" if pr.full_conflict_count > 0 else (
                 "#fd7e14" if pr.partial_conflict_count > 0 else "#0d6efd"
             )
+            global_row = ""
+            if pr.global_header_policies or pr.global_footer_policies:
+                local_count = (
+                    pr.total_policies
+                    - pr.global_header_policies
+                    - pr.global_footer_policies
+                )
+                global_row = (
+                    f'    <tr><td>Global Header / Local / Footer</td>'
+                    f'<td colspan="3"><strong>{pr.global_header_policies}</strong> global header '
+                    f'+ <strong>{local_count}</strong> local '
+                    f'+ <strong>{pr.global_footer_policies}</strong> global footer</td></tr>\n'
+                )
             html += f"""<div class="card pkg-card" style="border-left-color:{border_color}">
   <h3>{_esc(pr.fmg)} / {_esc(pr.adom)} / {_esc(pr.package)}</h3>
   <table>
     <tr><td>Total Policies</td><td><strong>{pr.total_policies}</strong></td>
         <td>Effective Policies</td><td><strong>{pr.effective_policies}</strong></td></tr>
-    <tr><td>Fully Shadowed (Conflict)</td><td><strong style="color:#dc3545">{pr.full_conflict_count}</strong></td>
+{global_row}    <tr><td>Fully Shadowed (Conflict)</td><td><strong style="color:#dc3545">{pr.full_conflict_count}</strong></td>
         <td>Partially Shadowed (Conflict)</td><td><strong style="color:#fd7e14">{pr.partial_conflict_count}</strong></td></tr>
     <tr><td>Fully Shadowed (Redundant)</td><td><strong style="color:#198754">{pr.full_redundant_count}</strong></td>
         <td>Partial Overlap (Redundant)</td><td><strong style="color:#0dcaf0">{pr.partial_redundant_count}</strong></td></tr>
@@ -618,7 +657,7 @@ def _html_findings_detail(package_results: List[PackageResult]) -> str:
                 html += f"""<details>
   <summary>
     {badges} {conf_badges}
-    &nbsp; Policy #{f0.shadowed_seq+1} (id={f0.shadowed_policyid}) &mdash; {_esc(f0.shadowed_name or 'unnamed')}
+    &nbsp; Policy #{f0.shadowed_seq+1} (id={f0.shadowed_policyid}) &mdash; {_esc(f0.shadowed_name or 'unnamed')}{_section_badge(f0.shadowed_section)}
     <span style="float:right;font-size:0.85em;color:var(--muted-text)">
       {len(findings)} relationship{"s" if len(findings) != 1 else ""}
       &bull; risk {max_risk:.1f}
@@ -667,12 +706,20 @@ def _html_findings_detail(package_results: List[PackageResult]) -> str:
                     ftype_label = FINDING_TYPE_LABELS.get(f.finding_type.value, f.finding_type.value)
                     ftype_color = FINDING_TYPE_COLORS.get(f.finding_type.value, "#adb5bd")
 
+                    # Pad sections defensively so zip lines up with the ids.
+                    sections = f.shadowing_sections or ["local"] * len(f.shadowing_policyids)
+
                     # Shadowing rules summary
                     if f.is_composite:
                         shad_summary = f"{len(f.shadowing_policyids)} rules (composite)"
+                        if any(s in ("global-header", "global-footer") for s in sections):
+                            shad_summary += " " + _section_badge("global-header") if "global-header" in sections else ""
+                            if "global-footer" in sections:
+                                shad_summary += " " + _section_badge("global-footer")
                     else:
                         shad_summary = ", ".join(
-                            f"#{s+1} id={pid}" for s, pid in zip(f.shadowing_seqs, f.shadowing_policyids)
+                            f"#{s+1} id={pid}{_section_badge(sec)}"
+                            for s, pid, sec in zip(f.shadowing_seqs, f.shadowing_policyids, sections)
                         )
                         # Add name for single-rule findings
                         if len(f.shadowing_names) == 1 and f.shadowing_names[0]:
@@ -1008,9 +1055,9 @@ def _excel_findings_sheet(wb, run_result: RunResult):
 
     headers = [
         "FMG", "ADOM", "Package",
-        "Shadowed Policy ID", "Shadowed Name", "Shadowed Seq",
+        "Shadowed Policy ID", "Shadowed Name", "Shadowed Seq", "Shadowed Section",
         "Finding Type", "Severity", "Is Composite",
-        "Shadowing Policy IDs", "Shadowing Names", "Shadowing Seqs",
+        "Shadowing Policy IDs", "Shadowing Names", "Shadowing Seqs", "Shadowing Sections",
         "SrcIntf Overlap", "DstIntf Overlap",
         "SrcAddr Overlap", "DstAddr Overlap",
         "Service Overlap", "Schedule Overlap",
@@ -1020,9 +1067,9 @@ def _excel_findings_sheet(wb, run_result: RunResult):
     ]
     widths = [
         14, 14, 18,
-        16, 20, 12,
+        16, 20, 12, 14,
         28, 12, 12,
-        22, 22, 18,
+        22, 22, 18, 18,
         20, 20,
         25, 25,
         20, 18,
@@ -1030,7 +1077,7 @@ def _excel_findings_sheet(wb, run_result: RunResult):
         14, 14, 12,
         12, 30, 50,
     ]
-    wrap_cols = {15, 16, 20, 25, 26}  # long text columns
+    wrap_cols = {17, 18, 22, 27, 28}  # long text columns
 
     _apply_header_row(ws, headers, widths)
 
@@ -1041,11 +1088,15 @@ def _excel_findings_sheet(wb, run_result: RunResult):
             values = [
                 d["fmg"], d["adom"], d["package"],
                 d["shadowed_policyid"], d["shadowed_name"], d["shadowed_seq"],
+                _SECTION_LABELS.get(d["shadowed_section"], d["shadowed_section"]),
                 FINDING_TYPE_LABELS.get(d["finding_type"], d["finding_type"]),
                 d["severity"], d["is_composite"],
                 ", ".join(str(x) for x in d["shadowing_policyids"]),
                 ", ".join(str(x) for x in d["shadowing_names"]),
                 ", ".join(str(x) for x in d["shadowing_seqs"]),
+                ", ".join(
+                    _SECTION_LABELS.get(s, s) for s in d.get("shadowing_sections", [])
+                ),
                 d["srcintf_overlap"], d["dstintf_overlap"],
                 d["srcaddr_overlap"], d["dstaddr_overlap"],
                 d["service_overlap"], d["schedule_overlap"],
@@ -1059,7 +1110,7 @@ def _excel_findings_sheet(wb, run_result: RunResult):
 
             # Color the severity cell
             sev = d["severity"]
-            sev_cell = ws.cell(row=row_num, column=8)
+            sev_cell = ws.cell(row=row_num, column=9)
             if sev in _SEVERITY_FILLS:
                 sev_cell.fill = _SEVERITY_FILLS[sev]
                 if sev in ("CRITICAL", "HIGH", "LOW"):
@@ -1075,21 +1126,27 @@ def _excel_packages_sheet(wb, run_result: RunResult):
 
     headers = [
         "FMG", "ADOM", "Package",
-        "Total Policies", "Effective Policies",
+        "Total Policies", "Global Header", "Local", "Global Footer",
+        "Effective Policies",
         "Full Conflict", "Partial Conflict",
         "Full Redundant", "Partial Redundant",
         "Indeterminate", "Total Findings",
         "Unsupported Objects", "Errors", "Time (s)",
     ]
-    widths = [14, 14, 20, 14, 16, 14, 16, 14, 16, 14, 14, 18, 10, 10]
+    widths = [14, 14, 20, 14, 14, 10, 14, 16, 14, 16, 14, 16, 14, 14, 18, 10, 10]
 
     _apply_header_row(ws, headers, widths)
 
     for i, pr in enumerate(run_result.package_results):
         row = i + 2
+        local_count = (
+            pr.total_policies - pr.global_header_policies - pr.global_footer_policies
+        )
         values = [
             pr.fmg, pr.adom, pr.package,
-            pr.total_policies, pr.effective_policies,
+            pr.total_policies, pr.global_header_policies, local_count,
+            pr.global_footer_policies,
+            pr.effective_policies,
             pr.full_conflict_count, pr.partial_conflict_count,
             pr.full_redundant_count, pr.partial_redundant_count,
             pr.indeterminate_count, len(pr.findings),
@@ -1122,7 +1179,7 @@ def _excel_policy_inventory_sheet(wb, run_result: RunResult):
 
     headers = [
         "FMG", "ADOM", "Package",
-        "Policy ID", "Name", "Seq #",
+        "Policy ID", "Name", "Seq #", "Section",
         "Action", "Status",
         "Source Interface", "Dest Interface",
         "SrcAddr Objects", "SrcAddr Resolved",
@@ -1131,8 +1188,8 @@ def _excel_policy_inventory_sheet(wb, run_result: RunResult):
         "Schedule",
         "Comments", "Has Unresolved", "Security Profiles",
     ]
-    widths = [14, 14, 18, 10, 20, 8, 10, 10, 16, 16, 25, 25, 25, 25, 20, 20, 14, 30, 14, 35]
-    wrap_cols = {11, 12, 13, 14, 18, 20}
+    widths = [14, 14, 18, 10, 20, 8, 14, 10, 10, 16, 16, 25, 25, 25, 25, 20, 20, 14, 30, 14, 35]
+    wrap_cols = {12, 13, 14, 15, 19, 21}
 
     _apply_header_row(ws, headers, widths)
 
@@ -1143,6 +1200,7 @@ def _excel_policy_inventory_sheet(wb, run_result: RunResult):
             values = [
                 p.fmg, p.adom, p.package,
                 p.policyid, p.name, p.seq_num,
+                _SECTION_LABELS.get(p.policy_section, p.policy_section),
                 p.action.value if p.action else "",
                 p.status,
                 p.srcintf.describe() if p.srcintf else "",

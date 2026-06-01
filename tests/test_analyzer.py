@@ -43,6 +43,7 @@ def _policy(
     status: str = "enable",
     install_scope=None,
     is_section_title: bool = False,
+    policy_section: str = "local",
 ) -> CanonicalPolicy:
     return CanonicalPolicy(
         fmg="test",
@@ -61,6 +62,7 @@ def _policy(
         status=status,
         install_scope=install_scope or InstallScope.global_scope(),
         is_section_title=is_section_title,
+        policy_section=policy_section,
     )
 
 
@@ -475,3 +477,69 @@ class TestEmptyPolicyList:
     def test_single_policy(self):
         findings = ShadowAnalyzer().analyze_package([_policy(1, 0)])
         assert findings == []
+
+
+# ---------------------------------------------------------------------------
+# 16. Global header/footer policy sections
+# ---------------------------------------------------------------------------
+
+class TestGlobalPolicySections:
+    """Global header/footer policies participate in the evaluation order and
+    their origin is recorded on the resulting findings."""
+
+    def test_global_header_shadows_local(self):
+        # Global header (deny any) precedes a local accept of a subset.
+        gheader = _policy(
+            101, 0, action=PolicyAction.DENY, policy_section="global-header"
+        )
+        local = _policy(
+            5, 1,
+            srcaddr=AddressSet.from_intervals(
+                [IPInterval.from_subnet("10.0.0.0", "255.255.255.0")]
+            ),
+            action=PolicyAction.ACCEPT,
+            policy_section="local",
+        )
+
+        findings = ShadowAnalyzer().analyze_package([gheader, local])
+        assert len(findings) == 1
+        f = findings[0]
+        assert f.finding_type == FindingType.FULL_CONFLICT_SHADOW
+        assert f.shadowed_policyid == 5
+        assert f.shadowed_section == "local"
+        assert f.shadowing_policyids == [101]
+        assert f.shadowing_sections == ["global-header"]
+
+    def test_local_shadows_global_footer(self):
+        # A broad local accept precedes (and shadows) a global footer rule.
+        local = _policy(
+            5, 0, action=PolicyAction.ACCEPT, policy_section="local"
+        )
+        gfooter = _policy(
+            201, 1,
+            srcaddr=AddressSet.from_intervals(
+                [IPInterval.from_subnet("10.0.0.0", "255.255.255.0")]
+            ),
+            action=PolicyAction.ACCEPT,
+            policy_section="global-footer",
+        )
+
+        findings = ShadowAnalyzer().analyze_package([local, gfooter])
+        assert len(findings) == 1
+        f = findings[0]
+        assert f.shadowed_policyid == 201
+        assert f.shadowed_section == "global-footer"
+        assert f.shadowing_sections == ["local"]
+
+
+class TestPolicyLabelSection:
+    """label() flags global header/footer origin; local stays unadorned."""
+
+    def test_label_includes_section(self):
+        assert _policy(1, 0, policy_section="local").label().startswith("#1 ")
+        assert _policy(1, 0, policy_section="global-header").label().startswith(
+            "[global-header] #1 "
+        )
+        assert _policy(1, 0, policy_section="global-footer").label().startswith(
+            "[global-footer] #1 "
+        )

@@ -127,6 +127,117 @@ def _extract_scope(policy_data: dict) -> List[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Per-policy normalization
+# ---------------------------------------------------------------------------
+
+def _build_policy(
+    raw: dict,
+    adom: str,
+    package: str,
+    seq_num: int,
+    group_map: Optional[Dict[str, Set[Tuple[str, str]]]] = None,
+    section: str = "local",
+) -> CanonicalPolicy:
+    """Normalize a single raw FMG policy dict into a CanonicalPolicy.
+
+    Raw object names are preserved under ``raw_data["_raw_*"]`` for later
+    resolution by objects.py.  ``section`` records the policy's origin in the
+    effective evaluation order ("local", "global-header", "global-footer").
+    """
+    section_title = _is_section_title(raw)
+
+    # Basic fields
+    policyid = raw.get("policyid", 0)
+    name = raw.get("name", "")
+    comments = raw.get("comments", "")
+    global_label = raw.get("global-label", "")
+
+    # Map action / status
+    action = _ACTION_MAP.get(raw.get("action", 1), PolicyAction.UNKNOWN)
+    status = _STATUS_MAP.get(raw.get("status", 1), "enable")
+
+    # List-type fields (raw names, not yet resolved)
+    srcintf = _extract_name_list(raw.get("srcintf"))
+    dstintf = _extract_name_list(raw.get("dstintf"))
+    srcaddr = _extract_name_list(raw.get("srcaddr"))
+    dstaddr = _extract_name_list(raw.get("dstaddr"))
+    service = _extract_name_list(raw.get("service"))
+    schedule = _extract_name_list(raw.get("schedule"))
+
+    # Per-policy install scope
+    scope_members = _extract_scope(raw)
+    install_scope = InstallScope.from_scope_members(scope_members, group_map=group_map)
+
+    # obj seq (FMG internal ordering field)
+    obj_seq = raw.get("obj seq", raw.get("obj_seq"))
+
+    # Security/UTM profile references
+    security_profiles = {}
+    profile_fields = [
+        'av-profile', 'webfilter-profile', 'ips-sensor',
+        'application-list', 'ssl-ssh-profile', 'dnsfilter-profile',
+        'emailfilter-profile', 'dlp-profile', 'file-filter-profile',
+        'voip-profile', 'casb-profile', 'waf-profile',
+        'profile-protocol-options', 'utm-status',
+    ]
+    for pf in profile_fields:
+        val = raw.get(pf)
+        if val and val not in (0, '0', '', 'none', None, [], ['']):
+            if isinstance(val, list):
+                names = []
+                for item in val:
+                    if isinstance(item, str):
+                        names.append(item)
+                    elif isinstance(item, dict):
+                        n = item.get('name', '')
+                        if n:
+                            names.append(n)
+                if names:
+                    security_profiles[pf] = ', '.join(names)
+            elif isinstance(val, str):
+                security_profiles[pf] = val
+            elif isinstance(val, (int, float)):
+                security_profiles[pf] = str(val)
+
+    # Negation flags
+    srcaddr_negate = raw.get("srcaddr-negate", 0) in ("enable", 1, "1")
+    dstaddr_negate = raw.get("dstaddr-negate", 0) in ("enable", 1, "1")
+    service_negate = raw.get("service-negate", 0) in ("enable", 1, "1")
+
+    policy = CanonicalPolicy(
+        adom=adom,
+        package=package,
+        policyid=policyid,
+        name=name,
+        seq_num=seq_num,
+        obj_seq=obj_seq,
+        action=action,
+        status=status,
+        install_scope=install_scope,
+        is_section_title=section_title,
+        global_label=global_label,
+        comments=comments,
+        raw_data=raw,
+        security_profiles=security_profiles,
+        srcaddr_negate=srcaddr_negate,
+        dstaddr_negate=dstaddr_negate,
+        service_negate=service_negate,
+        policy_section=section,
+    )
+
+    # Store raw name lists in raw_data for later resolution by objects.py.
+    policy.raw_data["_raw_srcintf"] = srcintf
+    policy.raw_data["_raw_dstintf"] = dstintf
+    policy.raw_data["_raw_srcaddr"] = srcaddr
+    policy.raw_data["_raw_dstaddr"] = dstaddr
+    policy.raw_data["_raw_service"] = service
+    policy.raw_data["_raw_schedule"] = schedule
+    policy.raw_data["_raw_scope"] = scope_members
+
+    return policy
+
+
+# ---------------------------------------------------------------------------
 # Core policy fetch
 # ---------------------------------------------------------------------------
 
@@ -182,102 +293,9 @@ def fetch_policies(
             log.debug("Skipping non-dict policy entry at seq %d", seq_num)
             continue
 
-        section_title = _is_section_title(raw)
-
-        # Extract basic fields
-        policyid = raw.get("policyid", 0)
-        name = raw.get("name", "")
-        comments = raw.get("comments", "")
-        global_label = raw.get("global-label", "")
-
-        # Map action
-        raw_action = raw.get("action", 1)
-        action = _ACTION_MAP.get(raw_action, PolicyAction.UNKNOWN)
-
-        # Map status
-        raw_status = raw.get("status", 1)
-        status = _STATUS_MAP.get(raw_status, "enable")
-
-        # Extract list-type fields (raw names, not yet resolved)
-        srcintf = _extract_name_list(raw.get("srcintf"))
-        dstintf = _extract_name_list(raw.get("dstintf"))
-        srcaddr = _extract_name_list(raw.get("srcaddr"))
-        dstaddr = _extract_name_list(raw.get("dstaddr"))
-        service = _extract_name_list(raw.get("service"))
-        schedule = _extract_name_list(raw.get("schedule"))
-
-        # Extract per-policy scope
-        scope_members = _extract_scope(raw)
-        install_scope = InstallScope.from_scope_members(scope_members, group_map=group_map)
-
-        # obj seq (FMG internal ordering field)
-        obj_seq = raw.get("obj seq", raw.get("obj_seq"))
-
-        # Extract security/UTM profile references
-        security_profiles = {}
-        profile_fields = [
-            'av-profile', 'webfilter-profile', 'ips-sensor',
-            'application-list', 'ssl-ssh-profile', 'dnsfilter-profile',
-            'emailfilter-profile', 'dlp-profile', 'file-filter-profile',
-            'voip-profile', 'casb-profile', 'waf-profile',
-            'profile-protocol-options', 'utm-status',
-        ]
-        for pf in profile_fields:
-            val = raw.get(pf)
-            if val and val not in (0, '0', '', 'none', None, [], ['']):
-                if isinstance(val, list):
-                    names = []
-                    for item in val:
-                        if isinstance(item, str):
-                            names.append(item)
-                        elif isinstance(item, dict):
-                            n = item.get('name', '')
-                            if n:
-                                names.append(n)
-                    if names:
-                        security_profiles[pf] = ', '.join(names)
-                elif isinstance(val, str):
-                    security_profiles[pf] = val
-                elif isinstance(val, (int, float)):
-                    security_profiles[pf] = str(val)
-
-        # Negation flags
-        srcaddr_negate = raw.get("srcaddr-negate", 0) in ("enable", 1, "1")
-        dstaddr_negate = raw.get("dstaddr-negate", 0) in ("enable", 1, "1")
-        service_negate = raw.get("service-negate", 0) in ("enable", 1, "1")
-
-        policy = CanonicalPolicy(
-            adom=adom,
-            package=package,
-            policyid=policyid,
-            name=name,
-            seq_num=seq_num,
-            obj_seq=obj_seq,
-            action=action,
-            status=status,
-            install_scope=install_scope,
-            is_section_title=section_title,
-            global_label=global_label,
-            comments=comments,
-            raw_data=raw,
-            security_profiles=security_profiles,
-            srcaddr_negate=srcaddr_negate,
-            dstaddr_negate=dstaddr_negate,
-            service_negate=service_negate,
+        policy = _build_policy(
+            raw, adom, package, seq_num, group_map=group_map, section="local"
         )
-
-        # Store raw name lists in raw_data for later resolution by objects.py
-        # The CanonicalPolicy match dimensions (srcintf, srcaddr, etc.) start
-        # as defaults (any) and get properly resolved by objects.py.
-        # We augment raw_data so the resolver can find the raw names easily.
-        policy.raw_data["_raw_srcintf"] = srcintf
-        policy.raw_data["_raw_dstintf"] = dstintf
-        policy.raw_data["_raw_srcaddr"] = srcaddr
-        policy.raw_data["_raw_dstaddr"] = dstaddr
-        policy.raw_data["_raw_service"] = service
-        policy.raw_data["_raw_schedule"] = schedule
-        policy.raw_data["_raw_scope"] = scope_members
-
         policies.append(policy)
 
     log.info(
@@ -287,6 +305,82 @@ def fetch_policies(
         package,
         sum(1 for p in policies if p.is_section_title),
     )
+
+    return policies
+
+
+# ---------------------------------------------------------------------------
+# Global header / footer policy fetch
+# ---------------------------------------------------------------------------
+
+def fetch_global_policies(
+    client,
+    adom: str,
+    package: str,
+    section: str,
+    group_map: Optional[Dict[str, Set[Tuple[str, str]]]] = None,
+) -> List[CanonicalPolicy]:
+    """
+    Fetch the global header or footer policies inherited by an ADOM package.
+
+    When a global-database policy package is assigned to an ADOM policy
+    package, its header policies are evaluated before all local rules and its
+    footer policies after.  FMG exposes the per-package view of these via:
+
+        /pm/config/adom/{adom}/pkg/{package}/global/header/policy
+        /pm/config/adom/{adom}/pkg/{package}/global/footer/policy
+
+    The object references in these policies (e.g. ``gall``, ``galways``) are
+    mirrored into the ADOM object database, so the standard ADOM ObjectResolver
+    resolves them — no separate global-scope resolver is required.
+
+    Args:
+        client: FMGClient instance.
+        adom: ADOM name.
+        package: policy package path.
+        section: "global-header" or "global-footer".
+        group_map: optional device-group expansion map for install scope.
+
+    Returns:
+        List of CanonicalPolicy in evaluation order.  Empty if the package has
+        no global policies assigned, or if the request fails (logged, not
+        raised — global policies are supplemental and must not abort analysis).
+    """
+    kind = "header" if section == "global-header" else "footer"
+    url = f"/pm/config/adom/{adom}/pkg/{package}/global/{kind}/policy"
+
+    # Per-policy install targets are returned under "scope member" only when
+    # the option is explicitly requested (same as local policies).
+    try:
+        result = client.get(url, option=["scope member"])
+    except Exception as exc:
+        log.warning(
+            "Could not fetch global %s policies for %s/%s: %s",
+            kind, adom, package, exc,
+        )
+        return []
+
+    if not isinstance(result, list):
+        if result is not None:
+            log.debug(
+                "Unexpected global %s policy response for %s/%s: %s",
+                kind, adom, package, type(result),
+            )
+        return []
+
+    policies: List[CanonicalPolicy] = []
+    for seq_num, raw in enumerate(result):
+        if not isinstance(raw, dict):
+            continue
+        policies.append(
+            _build_policy(raw, adom, package, seq_num, group_map=group_map, section=section)
+        )
+
+    if policies:
+        log.info(
+            "Fetched %d global %s policies for %s/%s",
+            len(policies), kind, adom, package,
+        )
 
     return policies
 
