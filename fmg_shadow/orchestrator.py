@@ -8,13 +8,50 @@ object resolution, and shadow analysis across multiple FMG instances.
 
 import gc
 import logging
+import re
 import time
 from datetime import datetime, timezone
 
 from fmg_shadow.models import PackageResult, RunResult
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 logger = logging.getLogger("fmg_shadow.orchestrator")
+
+
+def _detect_fmg_version(client) -> Optional[Tuple[int, int, int]]:
+    """Read and normalize the connected FortiManager firmware version."""
+    try:
+        status = client.get("/sys/status")
+    except Exception as exc:
+        logger.warning(
+            "[%s] Could not determine FortiManager version; ambiguous "
+            "per-policy install scopes will be excluded: %s",
+            getattr(client, "host", client),
+            exc,
+        )
+        return None
+
+    if isinstance(status, list):
+        status = status[0] if status and isinstance(status[0], dict) else {}
+    if not isinstance(status, dict):
+        return None
+
+    normalized = {
+        str(key).strip().lower(): value
+        for key, value in status.items()
+    }
+    try:
+        return (
+            int(normalized["major"]),
+            int(normalized["minor"]),
+            int(normalized["patch"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        version_text = str(normalized.get("version", ""))
+        match = re.search(r"v?(\d+)\.(\d+)\.(\d+)", version_text)
+        if match:
+            return tuple(int(part) for part in match.groups())
+    return None
 
 
 def analyze_single_package(
@@ -24,6 +61,7 @@ def analyze_single_package(
     config: dict,
     group_map: Optional[dict]= None,
     shared_resolver=None,
+    modern_scope_semantics: Optional[bool] = None,
 ) -> PackageResult:
     """
     Analyze a single policy package for shadow/redundancy issues.
@@ -56,27 +94,46 @@ def analyze_single_package(
         # 1. Fetch raw policies
         logger.info("[%s] Fetching policies from %s/%s ...", fmg_host, adom, package_name)
         include_disabled = config.get("include_disabled", False)
-        local_policies = fetch_policies(client, adom, package_name, include_disabled, group_map=group_map)
+        local_policies = fetch_policies(
+            client,
+            adom,
+            package_name,
+            include_disabled,
+            group_map=group_map,
+            modern_scope_semantics=modern_scope_semantics,
+        )
 
         # 1b. Fetch global header/footer policies inherited from the global
         #     database.  On the FortiGate these are evaluated as:
-        #       global headers -> local package policies -> global footers
+        #       global headers -> package-defined rules -> global footers
         #     so we splice them into a single ordered list and renumber the
         #     evaluation sequence to match.  This lets a global header shadow a
-        #     local rule, and a local rule (or header) shadow a global footer.
+        #     package rule, and a package rule (or header) shadow a global
+        #     footer.
         header_policies = []
         footer_policies = []
         if config.get("include_global_policies", True):
             header_policies = fetch_global_policies(
-                client, adom, package_name, "global-header", group_map=group_map
+                client,
+                adom,
+                package_name,
+                "global-header",
+                group_map=group_map,
+                modern_scope_semantics=modern_scope_semantics,
             )
             footer_policies = fetch_global_policies(
-                client, adom, package_name, "global-footer", group_map=group_map
+                client,
+                adom,
+                package_name,
+                "global-footer",
+                group_map=group_map,
+                modern_scope_semantics=modern_scope_semantics,
             )
 
         policies = header_policies + local_policies + footer_policies
         # Renumber to reflect the combined top-to-bottom evaluation order.
         for idx, p in enumerate(policies):
+            p.fmg = fmg_host
             p.seq_num = idx
 
         result.total_policies = len(policies)
@@ -167,6 +224,7 @@ def _slim_raw_data(policies) -> None:
         "internet-service", "internet-service-src",
         "internet-service-name", "internet-service-id",
         "internet-service-src-name", "internet-service-src-id",
+        "uuid",
     }
     for p in policies:
         if not p.raw_data:
@@ -260,6 +318,21 @@ def run_analysis(config: dict) -> RunResult:
             )
 
             with client:
+                from fmg_shadow.policy_fetch import (
+                    _scope_response_uses_explicit_empty,
+                )
+
+                fmg_version = _detect_fmg_version(client)
+                modern_scope_semantics = (
+                    _scope_response_uses_explicit_empty(fmg_version)
+                )
+                if fmg_version is not None:
+                    logger.info(
+                        "[%s] FortiManager version: %d.%d.%d",
+                        fmg_host,
+                        *fmg_version
+                    )
+
                 # Discover packages
                 package_names = _discover_packages(client, adom, config)
 
@@ -303,6 +376,7 @@ def run_analysis(config: dict) -> RunResult:
                         client, adom, pkg_name, config,
                         group_map=group_map,
                         shared_resolver=shared_resolver,
+                        modern_scope_semantics=modern_scope_semantics,
                     )
                     package_results.append(result)
 

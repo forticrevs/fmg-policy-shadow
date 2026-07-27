@@ -5,8 +5,6 @@ Tests all 15 scenarios using synthetic CanonicalPolicy objects with
 pre-resolved fields fed directly into ShadowAnalyzer.analyze_package().
 """
 
-import pytest
-
 from fmg_shadow.models import (
     AddressSet,
     CanonicalPolicy,
@@ -201,7 +199,6 @@ class TestCompositeShadowMultipleRules:
     """Three earlier rules whose srcaddr union fully covers the later rule's srcaddr."""
 
     def test_composite_shadow_multiple_rules(self):
-        svc = ServiceSet.any()
         # Later rule: srcaddr = 10.0.0.0/24 (10.0.0.0 - 10.0.0.255)
         later_src = AddressSet.from_intervals([IPInterval.from_subnet("10.0.0.0", "255.255.255.0")])
 
@@ -229,6 +226,32 @@ class TestCompositeShadowMultipleRules:
         assert cf.is_fully_unreachable is True
         assert cf.same_action is True
         assert cf.shadowed_policyid == 4
+
+    def test_composite_requires_every_source_to_cover_target_scope(self):
+        fw1 = InstallScope.from_scope_members([
+            {"name": "fw1", "vdom": "root"},
+        ])
+        fw1_fw2 = InstallScope.from_scope_members([
+            {"name": "fw1", "vdom": "root"},
+            {"name": "fw2", "vdom": "root"},
+        ])
+        first_half = AddressSet.from_intervals([
+            IPInterval.from_range("10.0.0.0", "10.0.0.127"),
+        ])
+        second_half = AddressSet.from_intervals([
+            IPInterval.from_range("10.0.0.128", "10.0.0.255"),
+        ])
+        whole = AddressSet.from_intervals([
+            IPInterval.from_subnet("10.0.0.0", "255.255.255.0"),
+        ])
+        r1 = _policy(1, 0, srcaddr=first_half, install_scope=fw1)
+        r2 = _policy(2, 1, srcaddr=second_half, install_scope=fw1)
+        later = _policy(3, 2, srcaddr=whole, install_scope=fw1_fw2)
+
+        findings = ShadowAnalyzer().analyze_package([r1, r2, later])
+
+        assert not any(finding.is_composite for finding in findings)
+        assert not any(finding.is_fully_unreachable for finding in findings)
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +327,65 @@ class TestInstallScopeSeparation:
 
         findings = ShadowAnalyzer().analyze_package([r1, r2])
         assert len(findings) == 0
+
+    def test_partial_scope_overlap_is_not_fully_unreachable(self):
+        earlier_scope = InstallScope.from_scope_members([
+            {"name": "fw1", "vdom": "root"},
+        ])
+        later_scope = InstallScope.from_scope_members([
+            {"name": "fw1", "vdom": "root"},
+            {"name": "fw2", "vdom": "root"},
+        ])
+
+        r1 = _policy(1, 0, install_scope=earlier_scope, action=PolicyAction.ACCEPT)
+        r2 = _policy(2, 1, install_scope=later_scope, action=PolicyAction.ACCEPT)
+
+        findings = ShadowAnalyzer().analyze_package([r1, r2])
+
+        assert len(findings) == 1
+        finding = findings[0]
+        assert finding.finding_type == FindingType.PARTIAL_REDUNDANT_OVERLAP
+        assert finding.is_fully_unreachable is False
+        assert "installation targets outside" in finding.residual_description
+        assert "Install scope only partially overlaps" in finding.explanation
+
+    def test_broader_scope_can_fully_shadow_narrower_scope(self):
+        earlier_scope = InstallScope.from_scope_members([
+            {"name": "fw1", "vdom": "root"},
+            {"name": "fw2", "vdom": "root"},
+        ])
+        later_scope = InstallScope.from_scope_members([
+            {"name": "fw1", "vdom": "root"},
+        ])
+
+        r1 = _policy(1, 0, install_scope=earlier_scope, action=PolicyAction.ACCEPT)
+        r2 = _policy(2, 1, install_scope=later_scope, action=PolicyAction.ACCEPT)
+
+        findings = ShadowAnalyzer().analyze_package([r1, r2])
+
+        assert len(findings) == 1
+        finding = findings[0]
+        assert finding.finding_type == FindingType.FULL_REDUNDANT_COVERAGE
+        assert finding.is_fully_unreachable is True
+
+    def test_malformed_empty_specific_scope_is_not_full_coverage(self):
+        malformed = InstallScope.no_targets()
+        earlier = _policy(1, 0, install_scope=InstallScope.global_scope())
+        later = _policy(2, 1, install_scope=malformed)
+
+        findings = ShadowAnalyzer().analyze_package([earlier, later])
+
+        assert findings == []
+
+    def test_no_target_earlier_policy_cannot_shadow_installed_policy(self):
+        earlier = _policy(
+            1,
+            0,
+            install_scope=InstallScope.no_targets(),
+        )
+        later = _policy(2, 1)
+
+        assert ShadowAnalyzer().analyze_package([earlier, later]) == []
 
 
 # ---------------------------------------------------------------------------

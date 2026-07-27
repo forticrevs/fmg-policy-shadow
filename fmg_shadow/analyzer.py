@@ -10,11 +10,9 @@ import logging
 from typing import Dict, List, Optional, Set
 
 from .models import (
-    AddressSet,
     CanonicalPolicy,
     Confidence,
     FindingType,
-    PolicyAction,
     ShadowFinding,
 )
 logger = logging.getLogger(__name__)
@@ -154,15 +152,19 @@ class ShadowAnalyzer:
         if not earlier.schedule.overlaps(later.schedule):
             return None
 
-        # Per-dimension containment
+        # Per-dimension containment.  Install scope is an additional
+        # reachability boundary: a rule that covers all L3/L4 dimensions on
+        # only some of the later rule's targets cannot make that rule fully
+        # unreachable everywhere it is installed.
         contains = self._dimension_contains(earlier, later)
+        scope_contains = earlier.install_scope.contains(later.install_scope)
 
         # If any negation is present, we cannot prove full containment —
         # force the finding to indeterminate / partial at best.
         if has_negation:
             full_shadow = False
         else:
-            full_shadow = all(contains.values())
+            full_shadow = all(contains.values()) and scope_contains
 
         # Determine same/different action
         same_action = earlier.action == later.action
@@ -224,6 +226,14 @@ class ShadowAnalyzer:
                 if has_unresolved
                 else []
             ),
+            residual_description=(
+                ""
+                if scope_contains
+                else (
+                    "Policy remains reachable on installation targets outside "
+                    "the shadowing rule's scope."
+                )
+            ),
         )
         finding.explanation = self._generate_explanation(finding, earlier, later)
         self._compute_risk_score(finding, [earlier], later)
@@ -238,7 +248,13 @@ class ShadowAnalyzer:
         earlier_policies: List[CanonicalPolicy],
         later: CanonicalPolicy,
     ) -> Optional[ShadowFinding]:
-        """Check if the *union* of earlier rules fully covers later."""
+        """Check if a conservative *union* of earlier rules covers later.
+
+        Every contributing policy must apply to the later policy's entire
+        install scope.  Coverage is still computed independently per match
+        dimension, so composite findings remain heuristic and are not used
+        for automated remediation.
+        """
         if not earlier_policies:
             return None
 
@@ -251,6 +267,8 @@ class ShadowAnalyzer:
         candidates = []
         for ep in earlier_policies:
             if ep.has_unresolved:
+                continue
+            if not ep.install_scope.contains(later.install_scope):
                 continue
             if not ep.srcintf.overlaps(later.srcintf):
                 continue
@@ -725,6 +743,14 @@ class ShadowAnalyzer:
         if finding.unsupported_notes:
             details.append(
                 "  - Unresolved objects: " + "; ".join(finding.unsupported_notes)
+            )
+
+        if not earlier.install_scope.contains(later.install_scope):
+            details.append(
+                "  - Install scope only partially overlaps "
+                f"(shadowing={earlier.install_scope.describe()}, "
+                f"shadowed={later.install_scope.describe()}); the shadowed "
+                "rule remains reachable on targets outside the overlap."
             )
 
         return intro + "\n" + "\n".join(details) if details else intro

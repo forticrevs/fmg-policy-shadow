@@ -1,7 +1,5 @@
 """Unit tests for fmg_shadow.models data models."""
 
-import pytest
-
 from fmg_shadow.models import (
     IPInterval,
     PortInterval,
@@ -743,6 +741,17 @@ class TestInstallScope:
         assert g.overlaps(specific)
         assert specific.overlaps(g)
 
+    def test_no_targets_scope_never_overlaps(self):
+        no_targets = InstallScope.no_targets()
+        global_scope = InstallScope.global_scope()
+        specific = InstallScope.from_scope_members([
+            {"name": "FW01", "vdom": "root"},
+        ])
+
+        assert not no_targets.overlaps(global_scope)
+        assert not global_scope.overlaps(no_targets)
+        assert not no_targets.overlaps(specific)
+
     def test_overlaps_shared_target(self):
         a = InstallScope.from_scope_members([
             {"name": "FW01", "vdom": "root"},
@@ -761,6 +770,47 @@ class TestInstallScope:
 
     def test_overlaps_both_global(self):
         assert InstallScope.global_scope().overlaps(InstallScope.global_scope())
+
+    def test_contains_global_covers_specific(self):
+        global_scope = InstallScope.global_scope()
+        specific = InstallScope.from_scope_members([
+            {"name": "FW01", "vdom": "root"},
+        ])
+        assert global_scope.contains(specific)
+        assert not specific.contains(global_scope)
+
+    def test_contains_specific_superset(self):
+        broader = InstallScope.from_scope_members([
+            {"name": "FW01", "vdom": "root"},
+            {"name": "FW02", "vdom": "root"},
+        ])
+        narrower = InstallScope.from_scope_members([
+            {"name": "FW01", "vdom": "root"},
+        ])
+        assert broader.contains(narrower)
+        assert not narrower.contains(broader)
+
+    def test_contains_specific_equal(self):
+        a = InstallScope.from_scope_members([
+            {"name": "FW01", "vdom": "root"},
+        ])
+        b = InstallScope.from_scope_members([
+            {"name": "fw01", "vdom": "ROOT"},
+        ])
+        assert a.contains(b)
+        assert b.contains(a)
+
+    def test_empty_specific_scope_never_proves_containment(self):
+        malformed = InstallScope.no_targets()
+        global_scope = InstallScope.global_scope()
+        specific = InstallScope.from_scope_members([
+            {"name": "FW01", "vdom": "root"},
+        ])
+
+        assert not malformed.contains(malformed)
+        assert not malformed.contains(specific)
+        assert not global_scope.contains(malformed)
+        assert malformed.describe() == "no targets"
 
     def test_describe_global(self):
         assert InstallScope.global_scope().describe() == "all targets"

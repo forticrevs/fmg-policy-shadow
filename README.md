@@ -6,7 +6,8 @@ It is designed around first-match firewall semantics and aims to be conservative
 
 - conservative: unresolved object dimensions are analyzed with reduced confidence, not skipped or guessed
 - explainable: every finding includes why the rule is shadowed, by which higher-priority rule(s), and a weighted risk score
-- scalable: package discovery, bulk object retrieval, caching, and concurrent package analysis are built in
+- scalable: package discovery, bulk object retrieval, caching, and
+  memory-conscious sequential package analysis are built in
 
 ## What it produces
 
@@ -15,6 +16,7 @@ For each run, the tool can generate:
 - HTML report (with dark mode toggle)
 - Excel workbook (`.xlsx`)
 - machine-readable JSON export
+- package-scoped FortiManager CLI Script Builder inside the HTML report
 
 The reports summarize:
 
@@ -32,7 +34,7 @@ The analyzer uses industry-standard definitions of rule shadowing under first-ma
 
 - **Fully Shadowed (Conflict)**: a higher-priority rule with a *different* action completely covers the lower-priority rule's match space. The shadowed rule is unreachable. *(Industry: contradictory shadow, conflicting rule)*
 - **Partially Shadowed (Conflict)**: a higher-priority rule with a *different* action covers part of the lower-priority rule's traffic. *(Industry: partial shadow)*
-- **Fully Shadowed (Redundant)**: a higher-priority rule with the *same* action completely covers the lower-priority rule. The rule is redundant and can be safely removed. *(Industry: redundant rule, covered rule)*
+- **Fully Shadowed (Redundant)**: a higher-priority rule with the *same* action completely covers the lower-priority rule within the modeled dimensions. The rule is a candidate for review and possible disablement. *(Industry: redundant rule, covered rule)*
 - **Partially Overlapping (Redundant)**: a higher-priority rule with the *same* action covers part of the lower-priority rule's traffic. *(Industry: partial redundancy)*
 - **Indeterminate (Unresolved Objects)**: overlap detected but unresolved objects prevent classification.
 
@@ -84,7 +86,11 @@ fmg-policy-shadow/
 │   └── cli_app.py                # CLI parser and runtime config
 └── tests/
     ├── test_models.py
-    └── test_analyzer.py
+    ├── test_analyzer.py
+    ├── test_objects.py
+    ├── test_orchestrator.py
+    ├── test_policy_fetch.py
+    └── test_reporting.py
 ```
 
 ## Architecture overview
@@ -117,11 +123,10 @@ fmg-policy-shadow/
 - address groups, including nested groups with exclude-member subtraction
 - services and service groups
 - schedules (recurring, onetime, groups)
-- **Internet Service Database (ISDB) entries** — multi-step resolution:
-  1. Fetch ISDB catalog from `/pm/config/adom/{adom}/_fdsdb/internet-service`
-  2. Map internet-service-name objects to ISDB IDs
-  3. Fetch actual IP range + port/protocol entries for each ISDB ID
-  4. Convert entries to resolved AddressSet + ServiceSet for downstream analysis
+- **Internet Service Database (ISDB) references** — catalog resolution for
+  readable labels. Full ISDB address/port expansion is intentionally not
+  attempted because individual services can contain millions of rows; those
+  policy dimensions remain unresolved and are analyzed conservatively.
 
 Normalized internal forms include:
 
@@ -137,7 +142,11 @@ Normalized internal forms include:
 
 - preserves raw references for later object resolution
 - extracts **security profile assignments** (av-profile, webfilter-profile, ips-sensor, application-list, ssl-ssh-profile, dnsfilter-profile, emailfilter-profile, dlp-profile, file-filter-profile, voip-profile, casb-profile, waf-profile, profile-protocol-options, utm-status)
-- **factors in global header/footer policies inherited from the global database.** When a global policy package is assigned to an ADOM package, FortiManager evaluates rules in the order `global headers → local package policies → global footers`. The analyzer fetches the per-package global header/footer policies (`/pm/config/adom/{adom}/pkg/{pkg}/global/{header,footer}/policy`), splices them into a single ordered list, and renumbers the evaluation sequence so a global header can shadow a local rule and a global footer can be shadowed by anything above it. Each policy and finding records its origin (`local`, `global-header`, `global-footer`), surfaced across all report formats. Global objects (`g`-prefixed) referenced by these policies resolve via the standard ADOM object database. Use `--no-global-policies` to analyze local policies only.
+- marks configured identity, SGT, ZTNA, IPv6, NGFW application/URL, dynamic
+  network-service, ToS, policy-expiry, VIP-match, and version-specific
+  Internet-service selectors as unresolved when their match semantics are not
+  modeled
+- **factors in global header/footer policies inherited from the global database.** When a global policy package is assigned to an ADOM package, FortiManager evaluates rules in the order `global headers → rules defined in the ADOM policy package → global footers`. The analyzer fetches the per-package global header/footer policies (`/pm/config/adom/{adom}/pkg/{pkg}/global/{header,footer}/policy`), splices them into a single ordered list, and renumbers the evaluation sequence so a global header can shadow a package rule and a global footer can be shadowed by anything above it. Each policy and finding records its internal origin (`local`, `global-header`, `global-footer`), surfaced across all report formats. Global objects (`g`-prefixed) referenced by these policies resolve via the standard ADOM object database. Use `--no-global-policies` to analyze only rules defined in the ADOM policy package.
 
 ### 5) Analysis engine
 
@@ -156,6 +165,7 @@ Normalized internal forms include:
 `fmg_shadow.reporting` generates:
 
 - self-contained HTML reports with **dark mode toggle** (persisted via localStorage)
+- an offline **CLI Script Builder** with analyzer recommendations and manual selection
 - structured explanation sections with formatted findings, color-coded dimensions, and risk scores
 - polished Excel workbooks using `openpyxl` (with security profile columns)
 - structured JSON suitable for downstream automation or trend tracking
@@ -172,8 +182,9 @@ Supported directly:
 - IPv4 ranges (`iprange`)
 - nested address groups
 - group exclusions where present
-- VIPs (external IP / extip)
-- VIP groups
+- VIP external IPs / groups are retained for reporting, but FortiOS VIP policy
+  priority semantics are marked unresolved and are not recommended
+  automatically
 - reserved objects like `all`
 
 Handled conservatively / flagged as unresolved:
@@ -186,13 +197,17 @@ Handled conservatively / flagged as unresolved:
 
 ### Internet Service Database (ISDB)
 
-Policies using `internet-service` or `internet-service-src` are now resolved via multi-step ISDB lookup:
+Policies using `internet-service` or `internet-service-src` are identified via
+the ISDB catalog:
 
 1. Internet-service-name → ISDB ID mapping
-2. ISDB ID → IP ranges + port/protocol entries
-3. Entries converted to AddressSet (IPs) + ServiceSet (ports/protocols)
+2. ISDB ID → human-readable catalog name
+3. The affected address/service dimensions are marked unresolved
 
-If the ISDB entries cannot be fetched, the objects fall back to unresolved/indeterminate status.
+The analyzer does not expand the underlying IP range and port/protocol rows.
+ISDB policies therefore remain indeterminate rather than being treated as
+definitively covered. They are not recommended automatically by the CLI Script
+Builder, but an operator may add them manually.
 
 ### Services
 
@@ -258,7 +273,9 @@ The effective rule domain is compared across six dimensions:
 For each higher-priority/lower-priority rule pair:
 
 - if any mandatory dimension has no overlap, there is no shadow relationship
-- if all dimensions overlap and the higher-priority rule fully contains the lower-priority rule, the finding is full shadow / full redundancy
+- if all dimensions overlap, the higher-priority rule fully contains the
+  lower-priority rule, and its install scope contains the lower rule's complete
+  install scope, the finding is full shadow / full redundancy
 - if overlap exists but full containment is not proven, the finding is partial shadow / partial redundancy
 - if object semantics are unresolved, the tool downgrades confidence and may classify as indeterminate
 
@@ -295,7 +312,11 @@ Score capped at 10.0. Higher scores can upgrade severity labels but never downgr
 pip install -r requirements.txt
 ```
 
-The core tool has **zero mandatory third-party dependencies** (stdlib only). The `requirements.txt` includes `openpyxl` for optional Excel export. If `openpyxl` is not installed, HTML and JSON still work and the tool will skip XLSX generation with a warning.
+The core tool has **zero mandatory third-party dependencies** (stdlib only).
+The `requirements.txt` includes `openpyxl` for optional Excel export and pins
+the last Python 3.6/3.7-compatible release on those runtimes. If `openpyxl` is
+not installed, HTML and JSON still work and the tool will skip XLSX generation
+with a warning.
 
 For development/testing:
 
@@ -384,7 +405,7 @@ python3 run_shadow.py --fmg 10.0.0.1 --adom root --all-packages --insecure
 --token             API token
 --output-dir / -o   report output directory
 --format            html,xlsx,json
---workers           concurrent package workers (default: 4)
+--workers           compatibility option (currently ignored; analysis is sequential)
 --include-disabled  include disabled rules in analysis
 --strict-unsupported fail instead of flagging unresolved semantics
 --no-global-policies skip global header/footer policies (default: included)
@@ -403,6 +424,16 @@ Executive-friendly report with:
 - **dark mode toggle** (☾/☼ button, persisted in localStorage)
 - summary dashboard with risk-aware statistics
 - package summaries with finding counts
+- **CLI Script Builder** with:
+  - cleared-by-default per-policy checkboxes
+  - analyzer-recommended fully shadowed rules
+  - individual manual selection of other enabled rules from the same package
+  - package-level and report-level controls that select recommendations only
+  - package-isolated preview, copy, and `.txt` download actions
+  - policy ID, name, UUID (when returned), original comments, finding type,
+    shadowing policy IDs, and install scope recorded as non-executing `#`
+    comments
+  - no connection back to FortiManager and no additional dependency
 - **findings grouped by shadowed policy** — each policy gets one expandable section containing:
   - summary banner with worst severity, finding type, confidence levels, relationship count, and max risk score
   - category pills (N conflicts, N redundant, N indeterminate)
@@ -412,6 +443,83 @@ Executive-friendly report with:
 - severity and finding-type coloring (industry-standard labels)
 - methodology section with compliance context
 - limitations section
+
+### Building a CLI script
+
+The analyzer remains read-only. The HTML report generates CLI text locally in
+the browser; it does not send a write request to FortiManager and does not
+require write permission for the analyzer's API account.
+
+The builder separates rules into two groups:
+
+- **Recommended** rules are fully shadowed rules that pass the analyzer's
+  strict recommendation checks. They can be selected individually, per
+  package, or across the report.
+- **Manual selection** lists the other enabled rules defined directly in the
+  same policy package. They can be added one at a time, even when their
+  analyzer result is partial, composite, unresolved, or absent.
+
+Nothing is selected when the report opens. Bulk selection affects Recommended
+rules only and never selects Manual choices.
+
+For an automatic recommendation, all of these checks must pass:
+
+- the shadowed rule is enabled, defined in the policy package, and has a valid
+  positive ID
+- the ID is unique among rules in that package and within FortiManager's supported
+  policy-ID range
+- the shadowed and shadowing rules use modeled `accept` or `deny` actions
+  and contain no unresolved match selectors
+- both rules use the exact `always` schedule
+- a non-composite finding proves it fully unreachable at high confidence
+  within the analyzer's supported L3/L4 dimensions
+- one verified higher-priority rule covers all L3/L4 dimensions
+- the higher-priority rule's install scope contains the shadowed rule's full
+  install scope
+
+Manual selection bypasses those recommendation checks, but it does not bypass
+CLI targeting checks. Already-disabled rules, inherited Global Header/Footer
+rules, and rules with invalid or duplicate IDs are not available. Inherited
+rules require a separate Global Database script workflow.
+
+The run reads the FortiManager version from `/sys/status` to interpret
+version-specific `Install On` responses. FortiManager 6 can omit `scope member`
+for both Default and None; the legacy `obj flags` scope bit is checked before
+Default is assumed. If the version or scope representation is ambiguous, that
+rule is excluded from automatic shadow recommendations but remains available
+for an explicit Manual selection when its CLI targeting fields are valid.
+
+The report creates one script per exact FortiManager / ADOM / policy package:
+
+```text
+# Generated by FMG Policy Shadow Analyzer 1.3.0
+# ADOM: root
+# Policy package: example-package
+# Run script on: Policy Package or ADOM Database
+# WARNING: Point-in-time output; regenerate immediately before execution.
+# WARNING: Verify every policy ID, name, and UUID in the package diff.
+
+config firewall policy
+# Policy ID: 123
+# Name: Example policy
+# UUID at analysis time: 11111111-2222-3333-4444-555555555555
+# Existing comments: Customer application traffic
+# Selection: Recommended by analyzer
+# Analyzer result: Fully Shadowed (Redundant)
+edit 123
+    set status disable
+next
+end
+```
+
+Import or paste the result as a **CLI Script**, choose **Policy Package or ADOM
+Database**, and select the exact package named in the script header. Do not run
+it with **Remote FortiGate Directly**. Regenerate the report immediately before
+execution because `edit <policy-id>` cannot assert a policy's identity and may
+edit a reused ID. Establish whatever package/ADOM lock or workflow session your
+FortiManager version requires, then verify every selected ID, name, and UUID in
+the package diff and installation preview before saving, submitting/approving,
+and installing as applicable.
 
 ### XLSX
 
@@ -454,10 +562,12 @@ python3 -m pytest tests/ -q
 Current test coverage includes:
 
 - model interval / set algebra
+- conservative object, VIP, schedule-group, and dynamic-mapping normalization
 - address breadth categorization
 - pairwise shadow detection
 - composite shadow detection
 - install-scope separation
+- recommended versus manual CLI Script Builder selection
 - schedule overlap handling
 - disabled-rule exclusion
 - section-title exclusion
@@ -470,13 +580,30 @@ This tool is intentionally conservative. It does not claim certainty when object
 Current limitations include:
 
 - FQDN and wildcard-style address semantics are flagged as unresolved — policies containing them are still analyzed on their resolved dimensions with reduced confidence
-- Internet-service (ISDB) entries are resolved where the FortiGuard database is accessible; entries that cannot be fetched remain indeterminate
+- Internet-service (ISDB) references are labeled from the FortiGuard catalog
+  but their full address/port datasets are not expanded; affected policies
+  remain indeterminate
 - schedule algebra is conservative rather than mathematically exhaustive in all cases
 - composite analysis is heuristic and pruned for performance
-- policy shadowing is only evaluated within overlapping install scope
-- application-layer criteria (App Control, URL filtering, etc.) are NOT considered in shadow analysis — the analysis is limited to L3/L4 match dimensions. Security profile assignments are captured and displayed for context.
+- composite findings are not recommended automatically, but package rules can
+  be added individually through Manual selection
+- policy shadowing is only evaluated within overlapping install scope, and a
+  full finding requires complete install-scope containment
+- generated scripts target rules defined directly in the selected policy
+  package; inherited Global Header/Footer rules require a separate Global
+  Database workflow
+- direct identity, SGT, ZTNA, IPv6, NGFW application/URL, dynamic-service, ToS,
+  expiry, VIP-match, and Internet-service selectors recognized by the
+  normalizer are marked unresolved and are not recommended automatically;
+  operators may still add those package rules manually, while the core
+  analysis remains limited to the modeled L3/L4 dimensions
+- ordinary post-selection security profile assignments (AV, Web Filter,
+  `application-list` in firewall-policy profile mode, IPS, and similar) are
+  captured and displayed for context rather than treated as match selectors
 - FortiManager- and version-specific response shapes may vary, especially for advanced features like `get referred`
-- VIP/DNAT destination translations are resolved where possible but complex scenarios may be missed
+- VIP/DNAT external addresses are retained for review, but policies using VIPs
+  are marked unresolved because VIP selection priority and complex translation
+  semantics are outside the analyzer's ordered L3/L4 model
 - Central SNAT/DNAT policies are not included in the analysis
 
 ## Troubleshooting

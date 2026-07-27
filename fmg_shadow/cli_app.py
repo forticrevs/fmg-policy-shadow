@@ -123,7 +123,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--workers",
         type=int,
         default=4,
-        help="Max concurrent package analysis threads (default: 4).",
+        help=(
+            "Compatibility option retained for existing invocations; package "
+            "analysis is currently sequential and this value is ignored."
+        ),
     )
     exec_group.add_argument(
         "--include-disabled",
@@ -299,7 +302,7 @@ def main(argv: Optional[List[str]]= None) -> None:
 
     from fmg_shadow.reporting import generate_all_reports
 
-    report_paths = generate_all_reports(run_result, str(output_dir), formats)
+    generate_all_reports(run_result, str(output_dir), formats)
 
     # ── Summary ──────────────────────────────────────────────────────
     counts = run_result.summary_counts()

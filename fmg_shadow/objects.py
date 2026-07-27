@@ -39,6 +39,67 @@ _WEEKDAY_MAP = {
     "saturday": 6,
 }
 
+_DYNAMIC_MAPPING_KEYS = {
+    "dynamic_mapping",
+    "dynamic-mapping",
+    "platform_mapping",
+    "platform-mapping",
+}
+
+
+def _has_nonempty_value(value) -> bool:
+    """Return whether a mapping/config value carries non-default content."""
+    if value is None or value is False:
+        return False
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set)):
+        return any(_has_nonempty_value(item) for item in value)
+    if isinstance(value, dict):
+        return any(_has_nonempty_value(item) for item in value.values())
+    return True
+
+
+def _has_dynamic_mapping(obj: dict) -> bool:
+    """Detect FortiManager per-device/per-platform object mappings."""
+    return any(
+        key in obj and _has_nonempty_value(obj.get(key))
+        for key in _DYNAMIC_MAPPING_KEYS
+    )
+
+
+def _is_enabled(value) -> bool:
+    return value in (True, 1, "1", "enable", "enabled")
+
+
+def _unresolved_address(name: str, reason: str) -> AddressSet:
+    result = AddressSet.empty()
+    result.unresolved_names.append("{}:{}".format(name, reason))
+    return result
+
+
+def _unresolved_service(name: str, reason: str) -> ServiceSet:
+    result = ServiceSet.empty()
+    result.unresolved_names.append("{}:{}".format(name, reason))
+    return result
+
+
+def _vip_has_restrictive_interface(value) -> bool:
+    """Return whether a VIP extintf is narrower than the default ``any``."""
+    if not value:
+        return False
+    if not isinstance(value, list):
+        value = [value]
+    names = []
+    for item in value:
+        if isinstance(item, dict):
+            item = item.get("name", "")
+        if item:
+            names.append(str(item).strip().lower())
+    return any(name != "any" for name in names)
+
 
 def _parse_port_range(spec: str) -> Tuple[PortInterval, Optional[PortInterval]]:
     """Parse FMG port range string like '80', '80-443', '80:1024-65535'.
@@ -69,6 +130,7 @@ def _paginated_fetch(
     client: Any,
     url: str,
     option: Optional[List[str]] = None,
+    loadsub: Optional[int] = None,
 ) -> List[dict]:
     """Fetch all records from an FMG API endpoint with pagination."""
     all_records: List[dict] = []
@@ -76,7 +138,12 @@ def _paginated_fetch(
     while True:
         range_ = [offset, _PAGE_SIZE]
         try:
-            data = client.get(url, option=option, range_=range_)
+            data = client.get(
+                url,
+                option=option,
+                range_=range_,
+                loadsub=loadsub,
+            )
         except Exception as exc:
             logger.warning("Fetch failed for %s offset=%d: %s", url, offset, exc)
             break
@@ -143,7 +210,12 @@ class ObjectResolver:
         """Bulk fetch all firewall address objects."""
         adom = adom or self.adom
         url = f"/pm/config/adom/{adom}/obj/firewall/address"
-        records = _paginated_fetch(self.client, url, option=["get reserved"])
+        records = _paginated_fetch(
+            self.client,
+            url,
+            option=["get reserved"],
+            loadsub=1,
+        )
         self._addresses = _to_dict_by_name(records)
         logger.info("Fetched %d address objects for adom=%s", len(self._addresses), adom)
         return self._addresses
@@ -152,7 +224,7 @@ class ObjectResolver:
         """Bulk fetch all firewall address group objects."""
         adom = adom or self.adom
         url = f"/pm/config/adom/{adom}/obj/firewall/addrgrp"
-        records = _paginated_fetch(self.client, url)
+        records = _paginated_fetch(self.client, url, loadsub=1)
         self._addrgroups = _to_dict_by_name(records)
         logger.info("Fetched %d address groups for adom=%s", len(self._addrgroups), adom)
         return self._addrgroups
@@ -161,7 +233,7 @@ class ObjectResolver:
         """Bulk fetch all firewall VIP objects."""
         adom = adom or self.adom
         url = f"/pm/config/adom/{adom}/obj/firewall/vip"
-        records = _paginated_fetch(self.client, url)
+        records = _paginated_fetch(self.client, url, loadsub=1)
         self._vips = _to_dict_by_name(records)
         logger.info("Fetched %d VIP objects for adom=%s", len(self._vips), adom)
         return self._vips
@@ -170,7 +242,7 @@ class ObjectResolver:
         """Bulk fetch all firewall VIP group objects."""
         adom = adom or self.adom
         url = f"/pm/config/adom/{adom}/obj/firewall/vipgrp"
-        records = _paginated_fetch(self.client, url)
+        records = _paginated_fetch(self.client, url, loadsub=1)
         self._vipgroups = _to_dict_by_name(records)
         logger.info("Fetched %d VIP groups for adom=%s", len(self._vipgroups), adom)
         return self._vipgroups
@@ -207,7 +279,12 @@ class ObjectResolver:
         """Bulk fetch all firewall service/custom objects."""
         adom = adom or self.adom
         url = f"/pm/config/adom/{adom}/obj/firewall/service/custom"
-        records = _paginated_fetch(self.client, url, option=["get reserved"])
+        records = _paginated_fetch(
+            self.client,
+            url,
+            option=["get reserved"],
+            loadsub=1,
+        )
         self._services = _to_dict_by_name(records)
         logger.info("Fetched %d service objects for adom=%s", len(self._services), adom)
         return self._services
@@ -216,7 +293,7 @@ class ObjectResolver:
         """Bulk fetch all firewall service group objects."""
         adom = adom or self.adom
         url = f"/pm/config/adom/{adom}/obj/firewall/service/group"
-        records = _paginated_fetch(self.client, url)
+        records = _paginated_fetch(self.client, url, loadsub=1)
         self._service_groups = _to_dict_by_name(records)
         logger.info("Fetched %d service groups for adom=%s", len(self._service_groups), adom)
         return self._service_groups
@@ -227,17 +304,17 @@ class ObjectResolver:
 
         url_onetime = f"/pm/config/adom/{adom}/obj/firewall/schedule/onetime"
         self._sched_onetime = _to_dict_by_name(
-            _paginated_fetch(self.client, url_onetime)
+            _paginated_fetch(self.client, url_onetime, loadsub=1)
         )
 
         url_recurring = f"/pm/config/adom/{adom}/obj/firewall/schedule/recurring"
         self._sched_recurring = _to_dict_by_name(
-            _paginated_fetch(self.client, url_recurring)
+            _paginated_fetch(self.client, url_recurring, loadsub=1)
         )
 
         url_group = f"/pm/config/adom/{adom}/obj/firewall/schedule/group"
         self._sched_groups = _to_dict_by_name(
-            _paginated_fetch(self.client, url_group)
+            _paginated_fetch(self.client, url_group, loadsub=1)
         )
 
         total = len(self._sched_onetime) + len(self._sched_recurring) + len(self._sched_groups)
@@ -365,6 +442,9 @@ class ObjectResolver:
         addr_type = obj.get("type", 0)
         name = obj.get("name", "unknown")
 
+        if _has_dynamic_mapping(obj):
+            return _unresolved_address(name, "dynamic-mapping")
+
         # type 0 / 'ipmask': subnet
         if addr_type in (0, "ipmask"):
             return self._resolve_ipmask(obj)
@@ -478,6 +558,10 @@ class ObjectResolver:
 
     def _resolve_addrgroup(self, grp_obj: dict, _depth: int) -> AddressSet:
         """Resolve an address group to the union of its members."""
+        name = grp_obj.get("name", "unknown")
+        if _has_dynamic_mapping(grp_obj):
+            return _unresolved_address(name, "dynamic-mapping")
+
         members = grp_obj.get("member", [])
         if isinstance(members, str):
             members = [members]
@@ -489,7 +573,7 @@ class ObjectResolver:
                 result = result.union(member_set)
 
         # Handle exclude-member
-        exclude = grp_obj.get("exclude", 0)
+        exclude = _is_enabled(grp_obj.get("exclude", 0))
         exclude_members = grp_obj.get("exclude-member", [])
         if exclude and exclude_members:
             if isinstance(exclude_members, str):
@@ -498,6 +582,14 @@ class ObjectResolver:
                 if isinstance(excl_name, str):
                     excl_set = self.resolve_address(excl_name, _depth + 1)
                     result = result.subtract(excl_set)
+                    if excl_set.unresolved_names:
+                        result.unresolved_names = list(set(
+                            result.unresolved_names
+                            + [
+                                "exclude:{}".format(unresolved)
+                                for unresolved in excl_set.unresolved_names
+                            ]
+                        ))
 
         return result
 
@@ -512,11 +604,20 @@ class ObjectResolver:
         name = vip_obj.get("name", "unknown")
         vip_type = vip_obj.get("type", "static-nat")
 
-        # FQDN and access-proxy VIPs cannot be resolved to intervals
-        if vip_type in ("fqdn", "access-proxy"):
-            result = AddressSet.empty()
-            result.unresolved_names.append(name)
-            return result
+        if _has_dynamic_mapping(vip_obj):
+            return _unresolved_address(name, "dynamic-mapping")
+
+        # Only a plain static NAT VIP is an address-only selector.  Port
+        # forwarding, virtual-server types, source filters, and restrictive
+        # external-interface bindings add match semantics not represented by
+        # AddressSet.
+        if (
+            vip_type not in (0, "static-nat")
+            or _is_enabled(vip_obj.get("portforward", 0))
+            or _has_nonempty_value(vip_obj.get("src-filter"))
+            or _vip_has_restrictive_interface(vip_obj.get("extintf"))
+        ):
+            return _unresolved_address(name, "complex-vip")
 
         extip = vip_obj.get("extip")
         if not extip:
@@ -546,7 +647,13 @@ class ObjectResolver:
                 logger.warning("Bad extip in VIP '%s': %s (raw=%r)", name, exc, entry)
 
         if intervals:
-            return AddressSet.from_intervals(intervals)
+            result = AddressSet.from_intervals(intervals)
+            # FortiOS gives policies containing VIPs special selection
+            # priority that ordinary top-to-bottom address containment does
+            # not model.  Keep the extip intervals for useful reporting while
+            # forcing confidence/remediation to remain conservative.
+            result.unresolved_names.append("{}:vip-priority".format(name))
+            return result
 
         result = AddressSet.empty()
         result.unresolved_names.append(name)
@@ -554,6 +661,10 @@ class ObjectResolver:
 
     def _resolve_vipgroup(self, grp_obj: dict, _depth: int) -> AddressSet:
         """Resolve a VIP group to the union of its member VIPs."""
+        name = grp_obj.get("name", "unknown")
+        if _has_dynamic_mapping(grp_obj):
+            return _unresolved_address(name, "dynamic-mapping")
+
         members = grp_obj.get("member", [])
         if isinstance(members, str):
             members = [members]
@@ -629,6 +740,9 @@ class ObjectResolver:
         protocol = obj.get("protocol", "")
         specs: List[ServiceSpec] = []
         name = obj.get("name", "unknown")
+
+        if _has_dynamic_mapping(obj):
+            return _unresolved_service(name, "dynamic-mapping")
 
         # protocol 5 = TCP/UDP/SCTP
         if protocol in (5, "TCP/UDP/SCTP"):
@@ -739,6 +853,10 @@ class ObjectResolver:
 
     def _resolve_service_group(self, grp_obj: dict, _depth: int) -> ServiceSet:
         """Resolve a service group to the union of its members."""
+        name = grp_obj.get("name", "unknown")
+        if _has_dynamic_mapping(grp_obj):
+            return _unresolved_service(name, "dynamic-mapping")
+
         members = grp_obj.get("member", [])
         if isinstance(members, str):
             members = [members]
@@ -841,6 +959,11 @@ class ObjectResolver:
     def _resolve_recurring_schedule(self, obj: dict) -> ScheduleSpec:
         """Resolve a recurring schedule object."""
         name = obj.get("name", "unknown")
+        if _has_dynamic_mapping(obj):
+            return ScheduleSpec(
+                unresolved_name="{}:dynamic-mapping".format(name),
+                raw_name=name,
+            )
         day_field = obj.get("day", [])
 
         # day can be a list of weekday name strings or a single string
@@ -867,6 +990,12 @@ class ObjectResolver:
         if isinstance(end_time, str) and len(end_time) > 5:
             end_time = end_time[:5]
 
+        if start_time and end_time and end_time < start_time:
+            return ScheduleSpec(
+                unresolved_name="{}:cross-midnight".format(name),
+                raw_name=name,
+            )
+
         # If no weekdays specified, treat as always-on-recurring (all days)
         if not weekdays:
             weekdays = set(range(7))
@@ -881,6 +1010,11 @@ class ObjectResolver:
     def _resolve_onetime_schedule(self, obj: dict) -> ScheduleSpec:
         """Resolve a onetime schedule object."""
         name = obj.get("name", "unknown")
+        if _has_dynamic_mapping(obj):
+            return ScheduleSpec(
+                unresolved_name="{}:dynamic-mapping".format(name),
+                raw_name=name,
+            )
         start_dt = obj.get("start", "")
         end_dt = obj.get("end", "")
 
@@ -893,15 +1027,20 @@ class ObjectResolver:
     def _resolve_schedule_group(self, grp_obj: dict, _depth: int) -> ScheduleSpec:
         """Resolve a schedule group.
 
-        Conservative approach: if any member is always, result is always.
-        Otherwise, return the first member's spec (schedule groups are rare
-        and complex to truly merge).
+        If any member is always, the group's OR semantics are exactly always.
+        Other unions remain unresolved until full schedule-union algebra is
+        implemented.
         """
         members = grp_obj.get("member", [])
         if isinstance(members, str):
             members = [members]
 
         name = grp_obj.get("name", "unknown")
+        if _has_dynamic_mapping(grp_obj):
+            return ScheduleSpec(
+                unresolved_name="{}:dynamic-mapping".format(name),
+                raw_name=name,
+            )
         resolved_members: List[ScheduleSpec] = []
 
         for member_name in members:
@@ -914,22 +1053,10 @@ class ObjectResolver:
         if not resolved_members:
             return ScheduleSpec(unresolved_name=name, raw_name=name)
 
-        # Return the first member as a conservative approximation
-        # (schedule groups are an OR of schedules, so any active member
-        # makes the schedule active - the first is a reasonable approx)
-        result = resolved_members[0]
-        # Override raw_name to the group name
-        result = ScheduleSpec(
-            is_always=result.is_always,
-            weekdays=result.weekdays,
-            start_time=result.start_time,
-            end_time=result.end_time,
-            start_datetime=result.start_datetime,
-            end_datetime=result.end_datetime,
-            unresolved_name=result.unresolved_name,
+        return ScheduleSpec(
+            unresolved_name="{}:schedule-group".format(name),
             raw_name=name,
         )
-        return result
 
     # ------------------------------------------------------------------
     # Bulk policy resolution
