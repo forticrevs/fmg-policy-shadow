@@ -15,7 +15,7 @@ from typing import Dict, List, Optional, Set, Tuple
 # Version
 # ---------------------------------------------------------------------------
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 
 # ---------------------------------------------------------------------------
@@ -288,7 +288,14 @@ class AddressSet:
 
     def union(self, other: "AddressSet") -> "AddressSet":
         if self.is_any or other.is_any:
-            return AddressSet.any()
+            result = AddressSet.any()
+            # Preserve semantic uncertainty even when the interval union is
+            # mathematically ANY.  Some unresolved objects (notably VIPs)
+            # also carry policy-priority semantics outside address algebra.
+            result.unresolved_names = list(set(
+                self.unresolved_names + other.unresolved_names
+            ))
+            return result
         combined = list(self.intervals) + list(other.intervals)
         unresolved = list(set(self.unresolved_names + other.unresolved_names))
         result = AddressSet.from_intervals(combined)
@@ -574,6 +581,11 @@ class InstallScope:
         return cls(is_global=True)
 
     @classmethod
+    def no_targets(cls) -> "InstallScope":
+        """A policy explicitly configured with ``Install On: None``."""
+        return cls(is_global=False, targets=set())
+
+    @classmethod
     def from_scope_members(
         cls,
         members: List[dict],
@@ -625,13 +637,38 @@ class InstallScope:
         return cls(is_global=False, targets=targets)
 
     def overlaps(self, other: "InstallScope") -> bool:
+        if (not self.is_global and not self.targets) or (
+            not other.is_global and not other.targets
+        ):
+            return False
         if self.is_global or other.is_global:
             return True
         return bool(self.targets & other.targets)
 
+    def contains(self, other: "InstallScope") -> bool:
+        """Return whether this scope covers every target in *other*.
+
+        A package-wide (global) scope contains every specific scope.  A
+        specific scope cannot contain a package-wide scope, and two specific
+        scopes use normal set containment.  An empty non-global scope means
+        that a policy has no installation targets, so it never proves
+        containment.
+        """
+        if (not self.is_global and not self.targets) or (
+            not other.is_global and not other.targets
+        ):
+            return False
+        if self.is_global:
+            return True
+        if other.is_global:
+            return False
+        return self.targets.issuperset(other.targets)
+
     def describe(self) -> str:
         if self.is_global:
             return "all targets"
+        if not self.targets:
+            return "no targets"
         return ", ".join(f"{n}/{v}" for n, v in sorted(self.targets))
 
 
@@ -688,9 +725,10 @@ class CanonicalPolicy:
     comments: str = ""
     raw_data: dict = field(default_factory=dict)
 
-    # Origin within the effective evaluation order.  Local package policies are
-    # "local"; policies inherited from the global database are "global-header"
-    # (evaluated before all local rules) or "global-footer" (evaluated after).
+    # Origin within the effective evaluation order. Rules defined directly in
+    # the ADOM policy package use the internal value "local"; inherited global
+    # policies are "global-header" (evaluated first) or "global-footer"
+    # (evaluated last).
     policy_section: str = "local"
 
     # Security profiles (UTM inspection profiles)
@@ -703,6 +741,8 @@ class CanonicalPolicy:
     def is_effective(self, include_disabled: bool = False) -> bool:
         """Is this policy part of the active evaluation chain?"""
         if self.is_section_title:
+            return False
+        if not self.install_scope.is_global and not self.install_scope.targets:
             return False
         if not include_disabled and self.status == "disable":
             return False

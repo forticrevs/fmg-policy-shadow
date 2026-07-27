@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from .models import (
     CanonicalPolicy,
     InstallScope,
+    InterfaceSet,
     PolicyAction,
 )
 
@@ -36,10 +37,139 @@ _STATUS_MAP = {
     "enable": "enable",
 }
 
+# Match criteria that the analyzer does not currently model.  A policy with
+# one of these configured must not receive a definitive full-shadow result or
+# become eligible for a generated disable script.
+_UNMODELED_MATCH_FIELDS = {
+    "groups": "identity user groups",
+    "users": "identity users",
+    "fsso-groups": "FSSO groups",
+    "devices": "legacy source devices",
+    "fsso": "FSSO identity matching",
+    "rsso": "RSSO identity matching",
+    "wsso": "WSSO identity matching",
+    "sgt": "security group tags",
+    "sgt-check": "security group tag checks",
+    "srcaddr6": "IPv6 source addresses",
+    "srcaddr6-negate": "negated IPv6 source addresses",
+    "dstaddr6": "IPv6 destination addresses",
+    "dstaddr6-negate": "negated IPv6 destination addresses",
+    "src-vendor-mac": "source vendor MAC",
+    "src-device": "source device",
+    "dst-device": "destination device",
+    "src-device-type": "source device type",
+    "dst-device-type": "destination device type",
+    "src-device-category": "source device category",
+    "dst-device-category": "destination device category",
+    "ztna-ems-tag": "ZTNA EMS tags",
+    "ztna-ems-tag-secondary": "secondary ZTNA EMS tags",
+    "ztna-ems-tag-negate": "negated ZTNA EMS tags",
+    "ztna-ems-tag6": "IPv6 ZTNA EMS tags",
+    "ztna-geo-tag": "ZTNA geography tags",
+    "ztna-destination": "ZTNA destination",
+    "ztna-device-ownership": "ZTNA device ownership",
+    "ztna-status": "ZTNA status",
+    "application": "application criteria",
+    "app-category": "application categories",
+    "app-group": "application groups",
+    "url-category": "URL categories",
+    "url-category-unitary": "unitary URL categories",
+    "tos": "type-of-service criteria",
+    "tos-mask": "type-of-service mask",
+    "tos-negate": "negated type-of-service criteria",
+    "vlan-filter": "VLAN filter",
+    "network-service-dynamic": "dynamic destination network service",
+    "network-service-src-dynamic": "dynamic source network service",
+    "match-vip-only": "VIP-only matching",
+    "policy-expiry": "policy expiry",
+    "reputation-minimum": "minimum IPv4 reputation",
+    "reputation-minimum6": "minimum IPv6 reputation",
+    "rtp-nat": "RTP NAT matching",
+    "rtp-addr": "RTP address matching",
+    "nat46": "NAT46 policy evaluation",
+    "nat64": "NAT64 policy evaluation",
+}
+
 
 # ---------------------------------------------------------------------------
 # Field extraction helpers
 # ---------------------------------------------------------------------------
+
+def _is_configured_match_value(value) -> bool:
+    """Return whether an unmodeled policy field has meaningful configuration."""
+    if value is None or value is False:
+        return False
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized.startswith("0x"):
+            try:
+                return int(normalized, 16) != 0
+            except ValueError:
+                return True
+        return normalized not in {
+            "", "0", "disable", "disabled", "none", "off",
+            "00", "0000-00-00", "0000-00-00 00:00:00",
+        }
+    if isinstance(value, (list, tuple, set)):
+        return any(_is_configured_match_value(item) for item in value)
+    if isinstance(value, dict):
+        return any(_is_configured_match_value(item) for item in value.values())
+    return True
+
+
+def _unmodeled_match_descriptions(
+    raw: dict,
+    action: PolicyAction,
+) -> List[str]:
+    """List configured match dimensions not represented by the analyzer."""
+    descriptions = []
+    for field, description in _UNMODELED_MATCH_FIELDS.items():
+        if _is_configured_match_value(raw.get(field)):
+            descriptions.append(description)
+
+    # ``match-vip`` changes VIP policy selection/priority and its defaults
+    # changed across FortiOS releases.  Enabled values on any rule, and any
+    # explicit value on a deny rule, are review-only until that priority is a
+    # modeled dimension.
+    match_vip = raw.get("match-vip")
+    if _is_configured_match_value(match_vip) or (
+        action == PolicyAction.DENY and "match-vip" in raw
+    ):
+        descriptions.append("VIP matching priority")
+
+    # Cover version-specific IPv4/IPv6 ISDB selectors, custom services,
+    # groups, names, and negations.  Empty/disabled defaults are ignored.
+    for field, value in raw.items():
+        if not isinstance(field, str):
+            continue
+        if (
+            field.startswith("internet-service")
+            or field.startswith("internet-service6")
+        ) and _is_configured_match_value(value):
+            descriptions.append("internet service criteria")
+            break
+
+    return descriptions
+
+
+def _contains_dynamic_mapping(value) -> bool:
+    """Detect embedded FortiManager per-device/per-platform mappings."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized_key = str(key).replace("-", "_").lower()
+            if normalized_key in {
+                "dynamic_mapping",
+                "platform_mapping",
+            } and _is_configured_match_value(item):
+                return True
+            if _contains_dynamic_mapping(item):
+                return True
+    elif isinstance(value, (list, tuple)):
+        return any(_contains_dynamic_mapping(item) for item in value)
+    return False
+
 
 def _extract_name_list(value) -> List[str]:
     """
@@ -82,8 +212,6 @@ def _is_section_title(policy_data: dict) -> bool:
     # A real section title has no meaningful policy fields
     has_srcintf = bool(policy_data.get("srcintf"))
     has_dstintf = bool(policy_data.get("dstintf"))
-    has_srcaddr = bool(policy_data.get("srcaddr"))
-    has_dstaddr = bool(policy_data.get("dstaddr"))
 
     if has_label and policyid == 0 and not (has_srcintf or has_dstintf):
         return True
@@ -96,7 +224,59 @@ def _is_section_title(policy_data: dict) -> bool:
     return False
 
 
-def _extract_scope(policy_data: dict) -> List[dict]:
+def _parse_obj_flags(value) -> Optional[int]:
+    """Normalize FortiManager ``obj flags`` from common response encodings."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return int(text, 0)
+        except ValueError:
+            try:
+                return int(text, 10)
+            except ValueError:
+                return None
+    return None
+
+
+def _scope_response_uses_explicit_empty(
+    version: Optional[Tuple[int, int, int]],
+) -> Optional[bool]:
+    """Return the install-scope response behavior for an FMG version.
+
+    FortiManager fixed the legacy ambiguity in 7.0.11, 7.2.5, and 7.4.3.
+    Newer release trains return an explicit empty ``scope member`` for
+    ``Install On: None``.  Unknown or unusual release trains stay unknown so
+    the remediation path can fail closed.
+    """
+    if version is None:
+        return None
+    major, minor, patch = version
+    if major < 7:
+        return False
+    if major > 7:
+        return True
+    fixed_patches = {
+        0: 11,
+        2: 5,
+        4: 3,
+    }
+    if minor in fixed_patches:
+        return patch >= fixed_patches[minor]
+    if minor >= 6 and minor % 2 == 0:
+        return True
+    return None
+
+
+def _extract_scope(
+    policy_data: dict,
+    modern_scope_semantics: Optional[bool] = None,
+) -> Tuple[str, List[dict]]:
     """
     Extract per-policy install scope.
 
@@ -104,26 +284,51 @@ def _extract_scope(policy_data: dict) -> List[dict]:
     the request includes option=["scope member"].  Falls back to "_scope"
     and "install-on" for compatibility.
 
-    Returns list of {'name': ..., 'vdom': ...} dicts, or empty list for
-    global scope (policy applies to all package targets).
+    Returns ``(state, members)`` where state is ``specific``, ``none``,
+    ``default``, or ``unknown``.  FortiManager 6 can omit ``scope member`` for
+    both Default and None; in that response shape, bit 16 of ``obj flags``
+    confirms Default.  Unknown version/flag combinations never default to a
+    package-wide scope.
     """
     # "scope member" is the primary field when option=["scope member"]
     # is used in the API request.
-    scope_member = policy_data.get("scope member")
-    if scope_member and isinstance(scope_member, list):
-        return scope_member
+    if "scope member" in policy_data:
+        scope_member = policy_data.get("scope member")
+        if not isinstance(scope_member, list):
+            return "unknown", []
+        if not scope_member:
+            return "none", []
+        return "specific", scope_member
 
     # _scope is a legacy/alternative field
-    scope = policy_data.get("_scope")
-    if scope and isinstance(scope, list):
-        return scope
+    if "_scope" in policy_data:
+        scope = policy_data.get("_scope")
+        if not isinstance(scope, list):
+            return "unknown", []
+        if not scope:
+            return "none", []
+        return "specific", scope
 
     # install-on is another alternative representation
-    install_on = policy_data.get("install-on")
-    if install_on and isinstance(install_on, list):
-        return install_on
+    if "install-on" in policy_data:
+        install_on = policy_data.get("install-on")
+        if not isinstance(install_on, list):
+            return "unknown", []
+        if not install_on:
+            return "none", []
+        return "specific", install_on
 
-    return []
+    obj_flags = _parse_obj_flags(
+        policy_data.get("obj flags", policy_data.get("obj_flags"))
+    )
+    if obj_flags is not None and obj_flags & 16:
+        return "default", []
+    if modern_scope_semantics is True:
+        return "default", []
+    if modern_scope_semantics is False:
+        return "none", []
+
+    return "unknown", []
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +342,7 @@ def _build_policy(
     seq_num: int,
     group_map: Optional[Dict[str, Set[Tuple[str, str]]]] = None,
     section: str = "local",
+    modern_scope_semantics: Optional[bool] = None,
 ) -> CanonicalPolicy:
     """Normalize a single raw FMG policy dict into a CanonicalPolicy.
 
@@ -153,8 +359,8 @@ def _build_policy(
     global_label = raw.get("global-label", "")
 
     # Map action / status
-    action = _ACTION_MAP.get(raw.get("action", 1), PolicyAction.UNKNOWN)
-    status = _STATUS_MAP.get(raw.get("status", 1), "enable")
+    action = _ACTION_MAP.get(raw.get("action"), PolicyAction.UNKNOWN)
+    status = _STATUS_MAP.get(raw.get("status"), "unknown")
 
     # List-type fields (raw names, not yet resolved)
     srcintf = _extract_name_list(raw.get("srcintf"))
@@ -165,8 +371,19 @@ def _build_policy(
     schedule = _extract_name_list(raw.get("schedule"))
 
     # Per-policy install scope
-    scope_members = _extract_scope(raw)
-    install_scope = InstallScope.from_scope_members(scope_members, group_map=group_map)
+    scope_state, scope_members = _extract_scope(
+        raw,
+        modern_scope_semantics=modern_scope_semantics,
+    )
+    if scope_state == "default":
+        install_scope = InstallScope.global_scope()
+    elif scope_state in {"none", "unknown"}:
+        install_scope = InstallScope.no_targets()
+    else:
+        install_scope = InstallScope.from_scope_members(
+            scope_members,
+            group_map=group_map,
+        )
 
     # obj seq (FMG internal ordering field)
     obj_seq = raw.get("obj seq", raw.get("obj_seq"))
@@ -211,6 +428,16 @@ def _build_policy(
         name=name,
         seq_num=seq_num,
         obj_seq=obj_seq,
+        srcintf=(
+            InterfaceSet.from_names(srcintf)
+            if srcintf
+            else InterfaceSet.any()
+        ),
+        dstintf=(
+            InterfaceSet.from_names(dstintf)
+            if dstintf
+            else InterfaceSet.any()
+        ),
         action=action,
         status=status,
         install_scope=install_scope,
@@ -225,6 +452,46 @@ def _build_policy(
         policy_section=section,
     )
 
+    for description in _unmodeled_match_descriptions(raw, action):
+        policy.has_unresolved = True
+        policy.unresolved_notes.append(
+            "unsupported match criterion:{}".format(description)
+        )
+    if _contains_dynamic_mapping(raw):
+        policy.has_unresolved = True
+        policy.unresolved_notes.append(
+            "unsupported per-device/per-platform dynamic mapping"
+        )
+    if action == PolicyAction.IPSEC:
+        policy.has_unresolved = True
+        policy.unresolved_notes.append(
+            "unsupported action semantics:policy-based IPsec"
+        )
+    elif action == PolicyAction.UNKNOWN:
+        policy.has_unresolved = True
+        policy.unresolved_notes.append("unsupported policy action")
+    if status == "unknown":
+        policy.has_unresolved = True
+        policy.unresolved_notes.append("unsupported policy status")
+    if scope_state == "unknown":
+        policy.has_unresolved = True
+        policy.unresolved_notes.append(
+            "ambiguous per-policy install scope in FortiManager response"
+        )
+    for field, values in (
+        ("source interface", srcintf),
+        ("destination interface", dstintf),
+        ("source address", srcaddr),
+        ("destination address", dstaddr),
+        ("service", service),
+        ("schedule", schedule),
+    ):
+        if not values:
+            policy.has_unresolved = True
+            policy.unresolved_notes.append(
+                "missing core match field:{}".format(field)
+            )
+
     # Store raw name lists in raw_data for later resolution by objects.py.
     policy.raw_data["_raw_srcintf"] = srcintf
     policy.raw_data["_raw_dstintf"] = dstintf
@@ -232,7 +499,7 @@ def _build_policy(
     policy.raw_data["_raw_dstaddr"] = dstaddr
     policy.raw_data["_raw_service"] = service
     policy.raw_data["_raw_schedule"] = schedule
-    policy.raw_data["_raw_scope"] = scope_members
+    policy.raw_data["_raw_scope"] = scope_members or []
 
     return policy
 
@@ -247,6 +514,7 @@ def fetch_policies(
     package: str,
     include_disabled: bool = False,
     group_map: Optional[Dict[str, Set[Tuple[str, str]]]] = None,
+    modern_scope_semantics: Optional[bool] = None,
 ) -> List[CanonicalPolicy]:
     """
     Fetch firewall policies from a FortiManager policy package.
@@ -294,7 +562,13 @@ def fetch_policies(
             continue
 
         policy = _build_policy(
-            raw, adom, package, seq_num, group_map=group_map, section="local"
+            raw,
+            adom,
+            package,
+            seq_num,
+            group_map=group_map,
+            section="local",
+            modern_scope_semantics=modern_scope_semantics,
         )
         policies.append(policy)
 
@@ -319,13 +593,15 @@ def fetch_global_policies(
     package: str,
     section: str,
     group_map: Optional[Dict[str, Set[Tuple[str, str]]]] = None,
+    modern_scope_semantics: Optional[bool] = None,
 ) -> List[CanonicalPolicy]:
     """
     Fetch the global header or footer policies inherited by an ADOM package.
 
     When a global-database policy package is assigned to an ADOM policy
-    package, its header policies are evaluated before all local rules and its
-    footer policies after.  FMG exposes the per-package view of these via:
+    package, its header policies are evaluated before all package-defined
+    rules and its footer policies after. FMG exposes the per-package view of
+    these via:
 
         /pm/config/adom/{adom}/pkg/{package}/global/header/policy
         /pm/config/adom/{adom}/pkg/{package}/global/footer/policy
@@ -350,7 +626,7 @@ def fetch_global_policies(
     url = f"/pm/config/adom/{adom}/pkg/{package}/global/{kind}/policy"
 
     # Per-policy install targets are returned under "scope member" only when
-    # the option is explicitly requested (same as local policies).
+    # the option is explicitly requested (same as package-defined rules).
     try:
         result = client.get(url, option=["scope member"])
     except Exception as exc:
@@ -373,7 +649,15 @@ def fetch_global_policies(
         if not isinstance(raw, dict):
             continue
         policies.append(
-            _build_policy(raw, adom, package, seq_num, group_map=group_map, section=section)
+            _build_policy(
+                raw,
+                adom,
+                package,
+                seq_num,
+                group_map=group_map,
+                section=section,
+                modern_scope_semantics=modern_scope_semantics,
+            )
         )
 
     if policies:

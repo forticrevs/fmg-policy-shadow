@@ -14,6 +14,7 @@ from .models import (
     CanonicalPolicy,
     FindingType,
     PackageResult,
+    PolicyAction,
     RunResult,
     ShadowFinding,
 )
@@ -64,9 +65,19 @@ FINDING_TYPE_COLORS = {
 
 # Human-readable labels for a policy's origin in the evaluation order.
 _SECTION_LABELS = {
-    "local": "Local",
+    "local": "Policy Package",
     "global-header": "Global Header",
     "global-footer": "Global Footer",
+}
+
+_FULLY_SHADOWED_TYPES = {
+    FindingType.FULL_CONFLICT_SHADOW,
+    FindingType.FULL_REDUNDANT_COVERAGE,
+}
+
+_DISABLE_FINDING_LABELS = {
+    FindingType.FULL_CONFLICT_SHADOW: "Fully Shadowed (Conflict)",
+    FindingType.FULL_REDUNDANT_COVERAGE: "Fully Shadowed (Redundant)",
 }
 
 
@@ -176,6 +187,13 @@ def generate_html_report(run_result: RunResult, output_path: str) -> str:
     html_parts.append(_html_dashboard(counts))
     html_parts.append(_html_package_cards(run_result.package_results))
     html_parts.append(_html_findings_detail(run_result.package_results))
+    html_parts.append(
+        _html_cli_script_builder(
+            run_result.package_results,
+            timestamp,
+            run_result.tool_version,
+        )
+    )
     html_parts.append(_html_methodology())
     html_parts.append(_html_limitations())
     html_parts.append(_html_footer())
@@ -191,6 +209,346 @@ def _esc(text: Any) -> str:
     """Escape HTML special characters."""
     s = str(text) if text is not None else ""
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def _policy_identity(policy: CanonicalPolicy):
+    """Identity stable within one package result."""
+    return (policy.policy_section, policy.seq_num, policy.policyid)
+
+
+def _finding_target_identity(finding: ShadowFinding):
+    """Map a finding back to the exact policy that was analyzed."""
+    return (
+        finding.shadowed_section,
+        finding.shadowed_seq,
+        finding.shadowed_policyid,
+    )
+
+
+def _policy_matches_package_result(
+    policy: CanonicalPolicy,
+    pr: PackageResult,
+) -> bool:
+    """Return whether a policy belongs to this exact report package."""
+    return (
+        policy.fmg == pr.fmg
+        and policy.adom == pr.adom
+        and policy.package == pr.package
+    )
+
+
+_MAX_FMG_POLICY_ID = 1071741824
+
+
+def _validated_policy_id(value) -> Optional[int]:
+    """Return a safe CLI policy ID, or None for ambiguous/invalid values."""
+    if isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    if (
+        not text
+        or len(text) > 10
+        or any(character not in "0123456789" for character in text)
+    ):
+        return None
+    try:
+        policy_id = int(text)
+    except (ValueError, OverflowError):
+        return None
+    # Require an explicit, positive existing FortiManager policy ID.  ``edit``
+    # can create an object, so defaults, section-title ID 0, and FMG's
+    # reserved range must never reach remediation.
+    if policy_id <= 0 or policy_id > _MAX_FMG_POLICY_ID:
+        return None
+    return policy_id
+
+
+def _package_policy_id_counts(pr: PackageResult) -> Dict[int, int]:
+    """Count valid IDs for rules defined directly in one policy package."""
+    counts: Dict[int, int] = {}
+    for policy in pr.policies:
+        if not _policy_matches_package_result(policy, pr):
+            continue
+        if policy.policy_section != "local" or policy.is_section_title:
+            continue
+        policy_id = _validated_policy_id(policy.policyid)
+        if policy_id is not None:
+            counts[policy_id] = counts.get(policy_id, 0) + 1
+    return counts
+
+
+def _collect_disable_candidates(pr: PackageResult) -> List[Dict[str, Any]]:
+    """Return rules the analyzer recommends for disabling.
+
+    A finding is eligible only when a single, high-confidence relationship
+    proves a rule defined in the policy package unreachable and the shadowing
+    rule's install scope contains the target rule's scope. Composite-union
+    findings are not automatic recommendations because the analyzer's
+    composite coverage is intentionally heuristic.
+    """
+    policies_by_identity = {
+        _policy_identity(policy): policy
+        for policy in pr.policies
+    }
+    package_policy_id_counts = _package_policy_id_counts(pr)
+    qualifying: OrderedDict[Any, List[ShadowFinding]] = OrderedDict()
+
+    for finding in pr.findings:
+        if (
+            finding.fmg != pr.fmg
+            or finding.adom != pr.adom
+            or finding.package != pr.package
+        ):
+            continue
+        if finding.finding_type not in _FULLY_SHADOWED_TYPES:
+            continue
+        if not finding.is_fully_unreachable:
+            continue
+        if finding.is_composite:
+            continue
+        if finding.confidence.value != "high":
+            continue
+        if finding.shadowed_section != "local":
+            continue
+        if (
+            len(finding.shadowing_policyids) != 1
+            or len(finding.shadowing_seqs) != 1
+            or (
+                finding.shadowing_sections
+                and len(finding.shadowing_sections) != 1
+            )
+        ):
+            continue
+
+        target_key = _finding_target_identity(finding)
+        target_policy = policies_by_identity.get(target_key)
+        if target_policy is None:
+            continue
+        if not _policy_matches_package_result(target_policy, pr):
+            continue
+        if target_policy.status != "enable" or target_policy.is_section_title:
+            continue
+        if target_policy.action not in {
+            PolicyAction.ACCEPT,
+            PolicyAction.DENY,
+        } or target_policy.has_unresolved:
+            continue
+        if (
+            target_policy.srcaddr.unresolved_names
+            or target_policy.dstaddr.unresolved_names
+            or target_policy.service.unresolved_names
+            or target_policy.schedule.unresolved_name
+        ):
+            continue
+        policy_id = _validated_policy_id(target_policy.policyid)
+        if policy_id is None:
+            continue
+        if package_policy_id_counts.get(policy_id) != 1:
+            continue
+
+        shadowing_sections = finding.shadowing_sections or ["local"]
+        shadowing_key = (
+            shadowing_sections[0],
+            finding.shadowing_seqs[0],
+            finding.shadowing_policyids[0],
+        )
+        shadowing_policy = policies_by_identity.get(shadowing_key)
+        if shadowing_policy is None:
+            continue
+        if not _policy_matches_package_result(shadowing_policy, pr):
+            continue
+        # Only the package rule ID is emitted as an executable ``edit`` value.
+        # Inherited global-header/footer policies legitimately use FMG's
+        # reserved high ID ranges, so applying the package edit-ID limit to the
+        # shadowing (comment-only) policy would reject valid relationships.
+        if shadowing_policy.is_section_title:
+            continue
+        if shadowing_policy.seq_num >= target_policy.seq_num:
+            continue
+        # ``--include-disabled`` deliberately adds disabled policies to the
+        # analysis, but they do not currently shadow active traffic and must
+        # never qualify an active target for remediation.
+        if shadowing_policy.status != "enable":
+            continue
+        if shadowing_policy.action not in {
+            PolicyAction.ACCEPT,
+            PolicyAction.DENY,
+        } or shadowing_policy.has_unresolved:
+            continue
+        if (
+            shadowing_policy.srcaddr.unresolved_names
+            or shadowing_policy.dstaddr.unresolved_names
+            or shadowing_policy.service.unresolved_names
+            or shadowing_policy.schedule.unresolved_name
+        ):
+            continue
+        # Schedule groups and cross-midnight recurring windows are handled
+        # conservatively by the analyzer.  The remediation path stays simpler
+        # and safer by accepting only package-default "always" schedules on
+        # both sides of the proof.
+        if (
+            not target_policy.schedule.is_always
+            or not shadowing_policy.schedule.is_always
+        ):
+            continue
+        if (
+            target_policy.srcaddr_negate
+            or target_policy.dstaddr_negate
+            or target_policy.service_negate
+            or shadowing_policy.srcaddr_negate
+            or shadowing_policy.dstaddr_negate
+            or shadowing_policy.service_negate
+        ):
+            continue
+        if not all((
+            shadowing_policy.srcintf.contains(target_policy.srcintf),
+            shadowing_policy.dstintf.contains(target_policy.dstintf),
+            shadowing_policy.srcaddr.contains(target_policy.srcaddr),
+            shadowing_policy.dstaddr.contains(target_policy.dstaddr),
+            shadowing_policy.service.contains(target_policy.service),
+            shadowing_policy.schedule.contains(target_policy.schedule),
+        )):
+            continue
+        if not shadowing_policy.install_scope.contains(target_policy.install_scope):
+            continue
+
+        qualifying.setdefault(target_key, []).append(finding)
+
+    candidates: List[Dict[str, Any]] = []
+    for target_key, findings in qualifying.items():
+        policy = policies_by_identity[target_key]
+        labels = sorted({
+            _DISABLE_FINDING_LABELS[finding.finding_type]
+            for finding in findings
+        })
+        shadowing_ids = sorted({
+            str(finding.shadowing_policyids[0])
+            for finding in findings
+        })
+        candidates.append({
+            "policy": policy,
+            "policy_id": _validated_policy_id(policy.policyid),
+            "selection_kind": "recommended",
+            "selection_label": "Recommended",
+            "script_selection_label": "Recommended by analyzer",
+            "finding_labels": labels,
+            "shadowing_policyids": shadowing_ids,
+            "max_risk": max(finding.risk_score for finding in findings),
+            "relationship_count": len(findings),
+        })
+
+    candidates.sort(
+        key=lambda candidate: (
+            candidate["policy"].seq_num,
+            candidate["policy_id"],
+        )
+    )
+    return candidates
+
+
+def _manual_finding_label(finding: ShadowFinding) -> str:
+    """Return a short finding label for the manual-selection table."""
+    if finding.finding_type in _DISABLE_FINDING_LABELS:
+        return _DISABLE_FINDING_LABELS[finding.finding_type]
+    return FINDING_TYPE_LABELS.get(
+        finding.finding_type.value,
+        finding.finding_type.value,
+    )
+
+
+def _collect_manual_script_candidates(
+    pr: PackageResult,
+    recommended: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Return other enabled package rules available by manual choice.
+
+    Manual selection deliberately bypasses the analyzer's recommendation
+    criteria. It does not bypass CLI targeting constraints: the rule must be
+    defined directly in this policy package, currently enabled, and have a
+    unique policy ID that is safe to place in an ``edit`` command.
+    """
+    recommended_keys = {
+        _policy_identity(candidate["policy"])
+        for candidate in recommended
+    }
+    package_policy_id_counts = _package_policy_id_counts(pr)
+    findings_by_target: Dict[Any, List[ShadowFinding]] = {}
+
+    for finding in pr.findings:
+        if (
+            finding.fmg != pr.fmg
+            or finding.adom != pr.adom
+            or finding.package != pr.package
+        ):
+            continue
+        key = _finding_target_identity(finding)
+        findings_by_target.setdefault(key, []).append(finding)
+
+    candidates: List[Dict[str, Any]] = []
+    for policy in pr.policies:
+        key = _policy_identity(policy)
+        if key in recommended_keys:
+            continue
+        if not _policy_matches_package_result(policy, pr):
+            continue
+        if policy.policy_section != "local" or policy.is_section_title:
+            continue
+        if policy.status != "enable":
+            continue
+        policy_id = _validated_policy_id(policy.policyid)
+        if (
+            policy_id is None
+            or package_policy_id_counts.get(policy_id) != 1
+        ):
+            continue
+
+        findings = findings_by_target.get(key, [])
+        labels = sorted({
+            _manual_finding_label(finding)
+            for finding in findings
+        })
+        shadowing_ids = sorted({
+            str(policy_id)
+            for finding in findings
+            for policy_id in finding.shadowing_policyids
+        })
+        candidates.append({
+            "policy": policy,
+            "policy_id": policy_id,
+            "selection_kind": "manual",
+            "selection_label": "Manual choice",
+            "script_selection_label": "Added manually",
+            "finding_labels": labels or ["Not recommended automatically"],
+            "shadowing_policyids": shadowing_ids,
+            "max_risk": (
+                max(finding.risk_score for finding in findings)
+                if findings
+                else None
+            ),
+            "relationship_count": len(findings),
+        })
+
+    candidates.sort(
+        key=lambda candidate: (
+            candidate["policy"].seq_num,
+            candidate["policy_id"],
+        )
+    )
+    return candidates
+
+
+def _inherited_script_rule_count(pr: PackageResult) -> int:
+    """Count enabled inherited rules that require a Global Database script."""
+    return sum(
+        1
+        for policy in pr.policies
+        if (
+            _policy_matches_package_result(policy, pr)
+            and policy.policy_section in {"global-header", "global-footer"}
+            and not policy.is_section_title
+            and policy.status == "enable"
+        )
+    )
 
 
 def _severity_badge(severity: str) -> str:
@@ -215,8 +573,8 @@ def _finding_type_badge(ftype: str) -> str:
 def _section_badge(section: str) -> str:
     """Small badge flagging a policy inherited from the global database.
 
-    Returns an empty string for local policies so the common case stays
-    uncluttered.
+    Returns an empty string for rules defined in the policy package so the
+    common case stays uncluttered.
     """
     if section not in ("global-header", "global-footer"):
         return ""
@@ -267,7 +625,11 @@ def _format_explanation(text: str) -> str:
     main_text = text
     if "\nSHADOWING_RULES:" in text:
         main_text, rules_raw = text.split("\nSHADOWING_RULES:", 1)
-        rule_lines = [l.strip() for l in rules_raw.strip().split("\n") if l.strip()]
+        rule_lines = [
+            line.strip()
+            for line in rules_raw.strip().split("\n")
+            if line.strip()
+        ]
         if rule_lines:
             rules_html = (
                 '  <details class="rules-details" open>\n'
@@ -312,7 +674,12 @@ def _format_explanation(text: str) -> str:
 
     if len(parts) > 1 and parts[1].strip():
         lines = parts[1].strip().split("\n")
-        bullets = [l.strip().lstrip("- ").strip() for l in lines if l.strip().startswith("-") or l.strip().startswith("  -")]
+        bullets = [
+            line.strip().lstrip("- ").strip()
+            for line in lines
+            if line.strip().startswith("-")
+            or line.strip().startswith("  -")
+        ]
         if bullets:
             html += "  <ul>\n"
             for b in bullets:
@@ -446,11 +813,59 @@ def _html_head(timestamp: str) -> str:
   .explanation-block li {{ margin: 3px 0; color: var(--text-color, #212529); }}
   .risk-score {{ display: inline-block; padding: 2px 10px; border-radius: 4px; font-weight: bold; font-size: 0.9em; }}
   .risk-factors {{ font-size: 0.82em; color: var(--muted-text, #6c757d); margin-top: 2px; }}
+  .remediation-intro {{ border-left: 4px solid #0d6efd; }}
+  .remediation-warning {{ margin: 12px 0; padding: 10px 14px; border-left: 3px solid #fd7e14;
+                          border-radius: 4px; background: var(--limitations-bg); }}
+  .remediation-stats {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }}
+  .remediation-stats span {{ background: var(--pill-bg); border-radius: 14px; padding: 4px 11px;
+                             font-size: 0.86em; }}
+  .remediation-global-controls, .remediation-package-controls, .remediation-actions {{
+    display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin: 12px 0;
+  }}
+  .remediation-package-controls {{ justify-content: space-between; }}
+  .remediation-target {{ margin: 6px 0 12px; padding: 9px 12px; background: var(--pre-bg);
+                         border-radius: 4px; }}
+  .remediation-note {{ color: var(--muted-text); font-size: 0.86em; margin-top: 8px; }}
+  .remediation-empty {{ margin-top: 12px; }}
+  .remediation-table-wrap {{ overflow-x: auto; border: 1px solid var(--border-color);
+                             border-radius: 5px; }}
+  .remediation-table {{ margin: 0; min-width: 940px; }}
+  .remediation-table .checkbox-column {{ width: 70px; text-align: center; }}
+  .selection-badge {{ display: inline-block; border-radius: 12px; padding: 3px 9px;
+                       font-size: 0.8em; font-weight: 600; white-space: nowrap; }}
+  .selection-badge.recommended {{ color: #0f5132; background: #d1e7dd; }}
+  .selection-badge.manual {{ color: #664d03; background: #fff3cd; }}
+  .manual-policy-picker {{ margin-top: 16px; padding: 10px 12px;
+                           border: 1px solid var(--border-color); border-radius: 5px; }}
+  .manual-policy-picker summary {{ cursor: pointer; font-weight: 650; }}
+  .manual-policy-picker > p {{ margin: 9px 0; color: var(--muted-text); }}
+  .remediation-table input[type="checkbox"],
+  .remediation-global-controls input[type="checkbox"],
+  .remediation-package-controls input[type="checkbox"] {{
+    width: 17px; height: 17px; vertical-align: middle; cursor: pointer;
+  }}
+  .comments-cell {{ max-width: 280px; white-space: normal; overflow-wrap: anywhere; }}
+  .selection-status, .copy-status {{ color: var(--muted-text); font-size: 0.86em; }}
+  .remediation-actions button, .remediation-global-controls button {{
+    border: 0; border-radius: 5px; padding: 8px 13px; color: #fff; background: #0d6efd;
+    font-weight: 600; cursor: pointer;
+  }}
+  .remediation-actions button.secondary-button,
+  .remediation-global-controls button.secondary-button {{ background: #6c757d; }}
+  .remediation-actions button:disabled {{ opacity: 0.45; cursor: not-allowed; }}
+  .cli-preview {{ width: 100%; min-height: 300px; resize: vertical; padding: 12px;
+                  border: 1px solid var(--border-color); border-radius: 5px;
+                  color: var(--text-color); background: var(--pre-bg);
+                  font: 0.86em/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
 </style>
 <script>
 (function() {{
-  if (localStorage.getItem('fmg-dark-mode') === 'true') {{
-    document.documentElement.style.background = '#0d1117';
+  try {{
+    if (localStorage.getItem('fmg-dark-mode') === 'true') {{
+      document.documentElement.style.background = '#0d1117';
+    }}
+  }} catch (error) {{
+    // Some browsers restrict localStorage for file:// reports.
   }}
 }})();
 </script>
@@ -585,12 +1000,14 @@ def _html_findings_detail(package_results: List[PackageResult]) -> str:
     for pr in package_results:
         fmg_groups.setdefault(pr.fmg, []).append(pr)
 
+    package_dom_index = 0
     for fmg_host, prs in fmg_groups.items():
-        html += f'<div class="fmg-group">\n'
+        html += '<div class="fmg-group">\n'
         html += f'<div class="fmg-group-header">FortiManager: {_esc(fmg_host)}</div>\n'
 
         for pr in prs:
-            html += f'<div class="pkg-group">\n'
+            package_dom_index += 1
+            html += '<div class="pkg-group">\n'
             pkg_label = f"{_esc(pr.adom)} / {_esc(pr.package)}"
             finding_count = len(pr.findings)
             html += f'<h4 class="pkg-group-header">{pkg_label} &mdash; {finding_count} finding{"s" if finding_count != 1 else ""}</h4>\n'
@@ -606,13 +1023,25 @@ def _html_findings_detail(package_results: List[PackageResult]) -> str:
                 )
                 for p in unresolved:
                     notes = "; ".join(p.unresolved_notes) if p.unresolved_notes else "unknown"
-                    html += f"<li>Policy #{p.seq_num+1} id={p.policyid} ({_esc(p.name or 'unnamed')}) &mdash; {_esc(notes)}</li>\n"
+                    html += (
+                        "<li>Policy #{} id={} ({}) &mdash; {}</li>\n".format(
+                            _esc(p.seq_num + 1),
+                            _esc(p.policyid),
+                            _esc(p.name or "unnamed"),
+                            _esc(notes),
+                        )
+                    )
                 html += "</ul></details>\n"
 
             # ── Group findings by shadowed policy ──
-            policy_groups: OD[int, list] = OD()
+            policy_groups = OD()
             for f in pr.findings:
-                policy_groups.setdefault(f.shadowed_policyid, []).append(f)
+                finding_key = (
+                    f.shadowed_section,
+                    f.shadowed_seq,
+                    f.shadowed_policyid,
+                )
+                policy_groups.setdefault(finding_key, []).append(f)
 
             # Sort policy groups by worst severity, then seq
             def _group_sort_key(item):
@@ -623,7 +1052,8 @@ def _html_findings_detail(package_results: List[PackageResult]) -> str:
 
             sorted_groups = sorted(policy_groups.items(), key=_group_sort_key)
 
-            for shadowed_pid, findings in sorted_groups:
+            detail_dom_index = 0
+            for _shadowed_key, findings in sorted_groups:
                 f0 = findings[0]
                 worst_sev = min(findings, key=lambda f: severity_order.get(f.severity_label(), 5)).severity_label()
                 worst_ftype = min(findings, key=lambda f: severity_order.get(f.severity_label(), 5)).finding_type.value
@@ -657,7 +1087,7 @@ def _html_findings_detail(package_results: List[PackageResult]) -> str:
                 html += f"""<details>
   <summary>
     {badges} {conf_badges}
-    &nbsp; Policy #{f0.shadowed_seq+1} (id={f0.shadowed_policyid}) &mdash; {_esc(f0.shadowed_name or 'unnamed')}{_section_badge(f0.shadowed_section)}
+    &nbsp; Policy #{_esc(f0.shadowed_seq+1)} (id={_esc(f0.shadowed_policyid)}) &mdash; {_esc(f0.shadowed_name or 'unnamed')}{_section_badge(f0.shadowed_section)}
     <span style="float:right;font-size:0.85em;color:var(--muted-text)">
       {len(findings)} relationship{"s" if len(findings) != 1 else ""}
       &bull; risk {max_risk:.1f}
@@ -718,7 +1148,11 @@ def _html_findings_detail(package_results: List[PackageResult]) -> str:
                                 shad_summary += " " + _section_badge("global-footer")
                     else:
                         shad_summary = ", ".join(
-                            f"#{s+1} id={pid}{_section_badge(sec)}"
+                            "#{} id={}{}".format(
+                                _esc(s + 1),
+                                _esc(pid),
+                                _section_badge(sec),
+                            )
                             for s, pid, sec in zip(f.shadowing_seqs, f.shadowing_policyids, sections)
                         )
                         # Add name for single-rule findings
@@ -732,7 +1166,11 @@ def _html_findings_detail(package_results: List[PackageResult]) -> str:
                         f'<span style="color:#198754">Same</span> ({_esc(f.shadowed_action)})'
                     )
 
-                    detail_id = f"detail-{shadowed_pid}-{idx}"
+                    detail_dom_index += 1
+                    detail_id = "detail-{}-{}".format(
+                        package_dom_index,
+                        detail_dom_index,
+                    )
 
                     html += f"""        <tr style="cursor:pointer" onclick="var el=document.getElementById('{detail_id}');el.style.display=el.style.display==='none'?'table-row':'none'">
           <td>{_severity_badge(sev)}</td>
@@ -791,6 +1229,228 @@ def _html_findings_detail(package_results: List[PackageResult]) -> str:
     return html
 
 
+def _render_cli_candidate_table(
+    candidates: List[Dict[str, Any]],
+    package_index: int,
+) -> str:
+    """Render one table of recommended or manually selectable rules."""
+    html = """  <div class="remediation-table-wrap">
+    <table class="remediation-table">
+      <thead>
+        <tr>
+          <th scope="col" class="checkbox-column">Select</th>
+          <th scope="col">Sequence</th>
+          <th scope="col">Policy ID</th>
+          <th scope="col">Name</th>
+          <th scope="col">Selection</th>
+          <th scope="col">Analyzer result</th>
+          <th scope="col">Action</th>
+          <th scope="col">Risk</th>
+          <th scope="col">Existing comments</th>
+        </tr>
+      </thead>
+      <tbody>
+"""
+
+    for candidate_index, candidate in enumerate(candidates):
+        policy = candidate["policy"]
+        selection_kind = candidate["selection_kind"]
+        checkbox_id = (
+            "cli-policy-{}-{}-{}".format(
+                package_index,
+                selection_kind,
+                candidate_index,
+            )
+        )
+        finding_label = "; ".join(candidate["finding_labels"])
+        shadowing_ids = ", ".join(candidate["shadowing_policyids"])
+        comments = str(policy.comments or "")
+        scope = policy.install_scope.describe()
+        policy_uuid = str((policy.raw_data or {}).get("uuid", "") or "")
+        risk = candidate["max_risk"]
+        risk_display = "{:.1f}".format(risk) if risk is not None else "—"
+        input_classes = "remediation-policy {}-policy".format(
+            selection_kind,
+        )
+        html += f"""        <tr class="{selection_kind}-candidate">
+          <td class="checkbox-column">
+            <input type="checkbox"
+                   id="{checkbox_id}"
+                   class="{input_classes}"
+                   autocomplete="off"
+                   data-policy-id="{candidate["policy_id"]}"
+                   data-sequence="{policy.seq_num + 1}"
+                   data-name="{_esc(policy.name or 'unnamed')}"
+                   data-comments="{_esc(comments)}"
+                   data-selection="{_esc(candidate["script_selection_label"])}"
+                   data-selection-kind="{selection_kind}"
+                   data-finding="{_esc(finding_label)}"
+                   data-shadowing-ids="{_esc(shadowing_ids)}"
+                   data-install-scope="{_esc(scope)}"
+                   data-uuid="{_esc(policy_uuid)}"
+                   aria-label="Select policy ID {candidate["policy_id"]}">
+          </td>
+          <td>{policy.seq_num + 1}</td>
+          <td><label for="{checkbox_id}"><code>{candidate["policy_id"]}</code></label></td>
+          <td>{_esc(policy.name or "unnamed")}</td>
+          <td><span class="selection-badge {selection_kind}">{_esc(candidate["selection_label"])}</span></td>
+          <td>{_esc(finding_label)}</td>
+          <td>{_esc(policy.action.value)}</td>
+          <td>{risk_display}</td>
+          <td class="comments-cell">{_esc(comments or "—")}</td>
+        </tr>
+"""
+
+    html += """      </tbody>
+    </table>
+  </div>
+"""
+    return html
+
+
+def _html_cli_script_builder(
+    package_results: List[PackageResult],
+    timestamp: str,
+    version: str,
+) -> str:
+    """Render an offline, package-scoped CLI script builder."""
+    prepared = []
+    recommended_total = 0
+    manual_total = 0
+    inherited_total = 0
+
+    for package_index, pr in enumerate(package_results):
+        recommended = _collect_disable_candidates(pr)
+        manual = _collect_manual_script_candidates(pr, recommended)
+        prepared.append((package_index, pr, recommended, manual))
+        recommended_total += len(recommended)
+        manual_total += len(manual)
+        inherited_total += _inherited_script_rule_count(pr)
+
+    available_total = recommended_total + manual_total
+    html = f"""<h2>CLI Script Builder</h2>
+<div class="card remediation-intro">
+  <h3>Build a script to disable policy package rules</h3>
+  <p>Choose the rules you want to disable, then preview, copy, or download the CLI script.
+     Rules marked <strong>Recommended</strong> were identified by the analyzer as fully
+     shadowed. Open <strong>Manual selection</strong> to add any other enabled rule from the
+     same policy package.</p>
+  <p>The report builds the script in your browser. It does not connect back to FortiManager or
+     make any changes by itself. Nothing is selected when the report opens.</p>
+  <div class="remediation-warning">
+    <strong>Before you run a script:</strong> confirm that you selected the correct policy
+    package and review every policy ID and name. A manually selected rule may still process
+    traffic, so check the FortiManager package diff and installation preview before installing.
+  </div>
+  <div class="remediation-stats">
+    <span><strong>{recommended_total}</strong> recommended fully shadowed rule{"s" if recommended_total != 1 else ""}</span>
+    <span><strong>{manual_total}</strong> other enabled package rule{"s" if manual_total != 1 else ""} available manually</span>
+    <span><strong>{inherited_total}</strong> inherited Global Policy Package rule{"s" if inherited_total != 1 else ""} unavailable here</span>
+  </div>
+"""
+
+    if recommended_total:
+        html += """  <div class="remediation-global-controls">
+    <label><input type="checkbox" id="remediationSelectAll" autocomplete="off">
+      Select all recommended rules in this report
+    </label>
+    <button type="button" id="remediationClearAll" class="secondary-button">Clear all</button>
+    <span id="remediationGlobalStatus" class="selection-status">0 selected</span>
+  </div>
+"""
+    elif available_total:
+        html += """  <p class="remediation-empty"><strong>No rules were recommended
+     automatically.</strong> You can still open Manual selection under a policy package and
+     choose individual rules.</p>
+  <div class="remediation-global-controls">
+    <button type="button" id="remediationClearAll" class="secondary-button">Clear all</button>
+    <span id="remediationGlobalStatus" class="selection-status">0 selected</span>
+  </div>
+"""
+    else:
+        html += """  <p class="remediation-empty"><strong>No rules are available for this
+     builder.</strong> It only lists enabled rules defined in the policy package with a valid,
+     unique policy ID.</p>
+"""
+    if available_total:
+        html += """  <p class="remediation-note">The report creates a separate script for each
+     policy package. Download each script from its package card.</p>
+"""
+    html += "</div>\n"
+
+    for package_index, pr, recommended, manual in prepared:
+        if not recommended and not manual:
+            continue
+
+        builder_id = f"cli-builder-{package_index}"
+        html += f"""<div class="card cli-builder"
+     id="{builder_id}"
+     data-fmg="{_esc(pr.fmg)}"
+     data-adom="{_esc(pr.adom)}"
+     data-package="{_esc(pr.package)}"
+     data-timestamp="{_esc(timestamp)}"
+     data-version="{_esc(version)}">
+  <h3>{_esc(pr.fmg)} / {_esc(pr.adom)} / {_esc(pr.package)}</h3>
+  <p class="remediation-target"><strong>Where to run this script:</strong> create or import a
+     <strong>CLI Script</strong>, select <strong>Policy Package or ADOM Database</strong>, and
+     choose <strong>{_esc(pr.package)}</strong>. Do not select
+     <em>Remote FortiGate Directly</em>.</p>
+  <div class="remediation-package-controls">
+"""
+        if recommended:
+            html += f"""    <label><input type="checkbox" class="package-select-all" autocomplete="off">
+      Select all {len(recommended)} recommended rule{"s" if len(recommended) != 1 else ""} in this package
+    </label>
+"""
+        html += """    <span class="selection-status">0 selected</span>
+  </div>
+"""
+
+        if recommended:
+            html += """  <h4>Recommended fully shadowed rules</h4>
+  <p class="remediation-note">The analyzer recommends these rules because it found them fully
+     shadowed. Select them individually or use the checkbox above.</p>
+"""
+            html += _render_cli_candidate_table(
+                recommended,
+                package_index,
+            )
+
+        if manual:
+            manual_summary = (
+                "Manual selection: choose from {} other enabled rule{}".format(
+                    len(manual),
+                    "s" if len(manual) != 1 else "",
+                )
+            )
+            html += f"""  <details class="manual-policy-picker">
+    <summary data-base-label="{_esc(manual_summary)}">{_esc(manual_summary)}</summary>
+    <p>These rules were not recommended automatically. Select a rule here only when you
+       intend to disable it and have reviewed the effect.</p>
+"""
+            html += _render_cli_candidate_table(
+                manual,
+                package_index,
+            )
+            html += "  </details>\n"
+
+        html += """  <div class="remediation-actions">
+    <button type="button" class="preview-cli" disabled>Preview script</button>
+    <button type="button" class="copy-cli secondary-button" disabled>Copy script</button>
+    <button type="button" class="download-cli" disabled>Download .txt</button>
+    <span class="copy-status" aria-live="polite"></span>
+  </div>
+  <textarea class="cli-preview" readonly hidden
+            aria-label="Generated FortiManager CLI script preview"></textarea>
+  <p class="remediation-note">Generate a fresh report before running the script. Check each
+     policy ID, name, and UUID in the package diff. If your FortiManager uses workspace or
+     workflow mode, follow its normal lock, approval, and install process.</p>
+</div>
+"""
+
+    return html
+
+
 def _html_methodology() -> str:
     return '''<h2>Methodology</h2>
 <div class="methodology">
@@ -844,7 +1504,9 @@ def _html_methodology() -> str:
   <h3 style="margin-top:14px;font-size:1em">Dimensions Compared</h3>
   <p style="margin-top:6px">Six match dimensions are evaluated: Source Interface, Destination Interface,
   Source Address, Destination Address, Service (protocol/ports), and Schedule. For full shadow
-  detection, all six dimensions must be covered by the higher-priority rule(s).</p>
+  detection, all six dimensions must be covered by the higher-priority rule(s). A pairwise full
+  finding also requires the higher-priority rule&rsquo;s install scope to contain every target
+  in the shadowed rule&rsquo;s install scope.</p>
 
   <h3 style="margin-top:14px;font-size:1em">Compliance Context</h3>
   <p style="margin-top:6px">Regular rule base review aligns with PCI DSS Requirement 1.1.7
@@ -862,13 +1524,22 @@ def _html_limitations() -> str:
     <li>Dynamic address groups and SDN connectors are not expanded.</li>
     <li>Geographic/country-based address objects are approximated or marked indeterminate.</li>
     <li>Schedule overlap analysis uses simplified time comparisons.</li>
-    <li>Internet-service (ISDB) entries are resolved where the FortiGuard database is accessible;
-        entries that cannot be fetched remain indeterminate.</li>
-    <li>Application-layer criteria (App Control, URL filtering, etc.) are NOT considered in shadow
-        analysis &mdash; the analysis is limited to L3/L4 match dimensions. However, security profile
-        assignments are captured and displayed for context.</li>
+    <li>Internet-service (ISDB) references are labeled from the FortiGuard catalog, but their
+        full address/port datasets are not expanded; affected policies remain indeterminate.</li>
+    <li>Recognized direct identity, SGT, ZTNA, IPv6, NGFW application/URL, dynamic-service,
+        ToS, expiry, VIP-match, and Internet-service selectors are marked unresolved. Rules
+        using them are not recommended automatically, but may be added through Manual
+        selection. Version-specific response fields may still vary.</li>
+    <li>Ordinary post-selection security profile assignments (AV, Web Filter, App Control
+        profiles, IPS, and similar) are captured and displayed for context; they are not modeled
+        as policy-selection dimensions.</li>
     <li>VIP/DNAT destination translations are resolved where possible but complex scenarios may be missed.</li>
     <li>Policy sets with install-scope restrictions are compared only when scopes overlap.</li>
+    <li>Composite-union shadow detection is heuristic. Composite findings are not recommended
+        automatically, but rules defined in the selected package remain available through
+        Manual selection.</li>
+    <li>Generated scripts can edit only rules defined directly in the selected policy package.
+        Inherited Global Header/Footer rules require a separate Global Database workflow.</li>
     <li>Central SNAT/DNAT policies are not included in the analysis.</li>
   </ul>
 </div>
@@ -882,16 +1553,343 @@ def _html_footer() -> str:
   var toggle = document.getElementById('darkToggle');
   var body = document.body;
   // Restore saved preference
-  if (localStorage.getItem('fmg-dark-mode') === 'true') {
-    body.classList.add('dark');
-    toggle.innerHTML = '&#9788;';  // sun
+  try {
+    if (localStorage.getItem('fmg-dark-mode') === 'true') {
+      body.classList.add('dark');
+      toggle.innerHTML = '&#9788;';  // sun
+    }
+  } catch (error) {
+    // Keep the default theme when file:// storage is unavailable.
   }
   toggle.addEventListener('click', function() {
     body.classList.toggle('dark');
     var isDark = body.classList.contains('dark');
-    localStorage.setItem('fmg-dark-mode', isDark);
+    try {
+      localStorage.setItem('fmg-dark-mode', isDark);
+    } catch (error) {
+      // Theme still toggles for this page even if it cannot be persisted.
+    }
     toggle.innerHTML = isDark ? '&#9788;' : '&#9790;';  // sun : moon
     document.documentElement.style.background = isDark ? '#0d1117' : '';
+  });
+})();
+
+(function() {
+  var builders = Array.prototype.slice.call(document.querySelectorAll('.cli-builder'));
+  if (!builders.length) {
+    return;
+  }
+
+  var globalSelect = document.getElementById('remediationSelectAll');
+  var clearAll = document.getElementById('remediationClearAll');
+  var globalStatus = document.getElementById('remediationGlobalStatus');
+
+  function safeMetadata(value) {
+    return String(value || '')
+      .replace(/[\\u0000-\\u001f\\u007f-\\u009f]+/g, ' ')
+      .replace(/[\\u00ad\\u061c\\u200b-\\u200f\\u202a-\\u202e\\u2060-\\u206f\\ufeff]+/g, '')
+      .replace(/\\s+/g, ' ')
+      .trim();
+  }
+
+  function selectedPolicies(builder) {
+    return Array.prototype.slice.call(
+      builder.querySelectorAll('.remediation-policy:checked')
+    ).sort(function(a, b) {
+      var seqDiff = Number(a.dataset.sequence) - Number(b.dataset.sequence);
+      if (seqDiff) {
+        return seqDiff;
+      }
+      return Number(a.dataset.policyId) - Number(b.dataset.policyId);
+    });
+  }
+
+  function buildCliScript(builder) {
+    var selected = selectedPolicies(builder);
+    var manualCount = selected.filter(function(input) {
+      return input.dataset.selectionKind === 'manual';
+    }).length;
+    var lines = [
+      '# Generated by FMG Policy Shadow Analyzer ' + safeMetadata(builder.dataset.version),
+      '# Report timestamp: ' + safeMetadata(builder.dataset.timestamp),
+      '# FortiManager: ' + safeMetadata(builder.dataset.fmg),
+      '# ADOM: ' + safeMetadata(builder.dataset.adom),
+      '# Policy package: ' + safeMetadata(builder.dataset.package),
+      '# Script type: CLI',
+      '# Run script on: Policy Package or ADOM Database',
+      '# WARNING: Run only against the exact package above; do not run directly on a FortiGate.',
+      '# WARNING: Point-in-time output; regenerate immediately before execution.',
+      '# WARNING: Verify every policy ID, name, and UUID in the package diff before installation.'
+    ];
+    if (manualCount) {
+      lines.push(
+        '# WARNING: ' + manualCount
+        + (manualCount === 1 ? ' rule was' : ' rules were')
+        + ' added manually and may still process traffic.'
+      );
+    }
+    lines.push('');
+    lines.push('config firewall policy');
+
+    selected.forEach(function(input) {
+      var policyId = safeMetadata(input.dataset.policyId);
+      if (
+        !/^[1-9][0-9]*$/.test(policyId)
+        || Number(policyId) > 1071741824
+      ) {
+        return;
+      }
+      lines.push('# ------------------------------------------------------------------');
+      lines.push('# Policy ID: ' + policyId);
+      lines.push('# Sequence at analysis time: ' + safeMetadata(input.dataset.sequence));
+      lines.push('# Name: ' + (safeMetadata(input.dataset.name) || 'unnamed'));
+      lines.push('# Selection: ' + safeMetadata(input.dataset.selection));
+      if (safeMetadata(input.dataset.uuid)) {
+        lines.push('# UUID at analysis time: ' + safeMetadata(input.dataset.uuid));
+      }
+      lines.push('# Existing comments: ' + (safeMetadata(input.dataset.comments) || '(none)'));
+      lines.push('# Analyzer result: ' + safeMetadata(input.dataset.finding));
+      if (safeMetadata(input.dataset.shadowingIds)) {
+        lines.push('# Shadowing policy ID(s): ' + safeMetadata(input.dataset.shadowingIds));
+      }
+      lines.push('# Installation scope: ' + safeMetadata(input.dataset.installScope));
+      lines.push('edit ' + policyId);
+      lines.push('    set status disable');
+      lines.push('next');
+    });
+
+    lines.push('end');
+    lines.push('');
+    return lines.join('\\n');
+  }
+
+  function safeFilenamePart(value) {
+    var part = safeMetadata(value)
+      .replace(/[^A-Za-z0-9._-]+/g, '_')
+      .replace(/^_+|_+$/g, '');
+    return part || 'unknown';
+  }
+
+  function clearRestoredSelections() {
+    document.querySelectorAll(
+      '.remediation-policy, .package-select-all, #remediationSelectAll'
+    ).forEach(function(input) {
+      input.checked = false;
+      input.indeterminate = false;
+    });
+  }
+
+  function scriptFilename(builder) {
+    return [
+      'disable-selected-policies',
+      safeFilenamePart(builder.dataset.fmg),
+      safeFilenamePart(builder.dataset.adom),
+      safeFilenamePart(builder.dataset.package)
+    ].join('_') + '.txt';
+  }
+
+  function syncGlobalStatus() {
+    var all = Array.prototype.slice.call(
+      document.querySelectorAll('.remediation-policy')
+    );
+    var recommended = Array.prototype.slice.call(
+      document.querySelectorAll('.recommended-policy')
+    );
+    var selected = all.filter(function(input) { return input.checked; });
+    var selectedRecommended = selected.filter(function(input) {
+      return input.dataset.selectionKind === 'recommended';
+    }).length;
+    var selectedManual = selected.length - selectedRecommended;
+    if (globalStatus) {
+      globalStatus.textContent = selected.length + ' selected';
+      if (selected.length) {
+        globalStatus.textContent += (
+          ' (' + selectedRecommended + ' recommended, '
+          + selectedManual + ' manual)'
+        );
+      }
+    }
+    if (globalSelect) {
+      globalSelect.checked = (
+        recommended.length > 0
+        && selectedRecommended === recommended.length
+      );
+      globalSelect.indeterminate = (
+        selectedRecommended > 0
+        && selectedRecommended < recommended.length
+      );
+    }
+  }
+
+  function syncBuilder(builder) {
+    var recommended = Array.prototype.slice.call(
+      builder.querySelectorAll('.recommended-policy')
+    );
+    var selected = selectedPolicies(builder);
+    var count = selected.length;
+    var selectedRecommended = selected.filter(function(input) {
+      return input.dataset.selectionKind === 'recommended';
+    }).length;
+    var selectedManual = count - selectedRecommended;
+    var packageToggle = builder.querySelector('.package-select-all');
+    var status = builder.querySelector('.selection-status');
+    var preview = builder.querySelector('.cli-preview');
+    var manualSummary = builder.querySelector(
+      '.manual-policy-picker summary'
+    );
+
+    status.textContent = count + ' selected';
+    if (count) {
+      status.textContent += (
+        ' (' + selectedRecommended + ' recommended, '
+        + selectedManual + ' manual)'
+      );
+    }
+    if (packageToggle) {
+      packageToggle.checked = (
+        recommended.length > 0
+        && selectedRecommended === recommended.length
+      );
+      packageToggle.indeterminate = (
+        selectedRecommended > 0
+        && selectedRecommended < recommended.length
+      );
+    }
+    if (manualSummary) {
+      manualSummary.textContent = manualSummary.dataset.baseLabel;
+      if (selectedManual) {
+        manualSummary.textContent += ' — ' + selectedManual + ' selected';
+      }
+    }
+
+    Array.prototype.forEach.call(
+      builder.querySelectorAll('.preview-cli, .copy-cli, .download-cli'),
+      function(button) { button.disabled = count === 0; }
+    );
+
+    if (!preview.hidden && count > 0) {
+      preview.value = buildCliScript(builder);
+    } else if (count === 0) {
+      preview.value = '';
+      preview.hidden = true;
+      builder.querySelector('.preview-cli').textContent = 'Preview script';
+    }
+    syncGlobalStatus();
+  }
+
+  function copyText(text) {
+    if (navigator.clipboard && window.isSecureContext) {
+      return navigator.clipboard.writeText(text);
+    }
+    return new Promise(function(resolve, reject) {
+      var helper = document.createElement('textarea');
+      helper.value = text;
+      helper.setAttribute('readonly', '');
+      helper.style.position = 'fixed';
+      helper.style.opacity = '0';
+      document.body.appendChild(helper);
+      helper.select();
+      try {
+        if (!document.execCommand('copy')) {
+          throw new Error('Copy command was rejected');
+        }
+        resolve();
+      } catch (error) {
+        reject(error);
+      } finally {
+        document.body.removeChild(helper);
+      }
+    });
+  }
+
+  clearRestoredSelections();
+
+  builders.forEach(function(builder) {
+    var packageToggle = builder.querySelector('.package-select-all');
+    var previewButton = builder.querySelector('.preview-cli');
+    var copyButton = builder.querySelector('.copy-cli');
+    var downloadButton = builder.querySelector('.download-cli');
+    var preview = builder.querySelector('.cli-preview');
+    var copyStatus = builder.querySelector('.copy-status');
+
+    builder.querySelectorAll('.remediation-policy').forEach(function(input) {
+      input.addEventListener('change', function() {
+        copyStatus.textContent = '';
+        syncBuilder(builder);
+      });
+    });
+
+    if (packageToggle) {
+      packageToggle.addEventListener('change', function() {
+        builder.querySelectorAll('.recommended-policy').forEach(function(input) {
+          input.checked = packageToggle.checked;
+        });
+        copyStatus.textContent = '';
+        syncBuilder(builder);
+      });
+    }
+
+    previewButton.addEventListener('click', function() {
+      preview.hidden = !preview.hidden;
+      if (!preview.hidden) {
+        preview.value = buildCliScript(builder);
+        previewButton.textContent = 'Hide preview';
+      } else {
+        previewButton.textContent = 'Preview script';
+      }
+    });
+
+    copyButton.addEventListener('click', function() {
+      var script = buildCliScript(builder);
+      preview.value = script;
+      copyText(script).then(function() {
+        copyStatus.textContent = 'Copied.';
+      }).catch(function() {
+        copyStatus.textContent = 'Copy failed; use the preview and copy manually.';
+        preview.hidden = false;
+        previewButton.textContent = 'Hide preview';
+      });
+    });
+
+    downloadButton.addEventListener('click', function() {
+      var blob = new Blob([buildCliScript(builder)], {
+        type: 'text/plain;charset=utf-8'
+      });
+      var url = URL.createObjectURL(blob);
+      var link = document.createElement('a');
+      link.href = url;
+      link.download = scriptFilename(builder);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.setTimeout(function() { URL.revokeObjectURL(url); }, 0);
+      copyStatus.textContent = 'Downloaded ' + link.download + '.';
+    });
+
+    syncBuilder(builder);
+  });
+
+  if (globalSelect) {
+    globalSelect.addEventListener('change', function() {
+      document.querySelectorAll('.recommended-policy').forEach(function(input) {
+        input.checked = globalSelect.checked;
+      });
+      builders.forEach(syncBuilder);
+    });
+  }
+
+  if (clearAll) {
+    clearAll.addEventListener('click', function() {
+      document.querySelectorAll('.remediation-policy').forEach(function(input) {
+        input.checked = false;
+      });
+      builders.forEach(syncBuilder);
+    });
+  }
+
+  window.addEventListener('pageshow', function() {
+    clearRestoredSelections();
+    builders.forEach(syncBuilder);
   });
 })();
 </script>
@@ -1020,7 +2018,7 @@ def _excel_summary_sheet(wb, run_result: RunResult):
 
     for row_idx, (label, value) in enumerate(meta, 1):
         cell_a = ws.cell(row=row_idx, column=1, value=label)
-        cell_b = ws.cell(row=row_idx, column=2, value=value)
+        ws.cell(row=row_idx, column=2, value=value)
         if label in ("SUMMARY", "FINDINGS BY TYPE"):
             cell_a.font = section_font
         else:
